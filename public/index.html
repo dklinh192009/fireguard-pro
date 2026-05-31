@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FireGuard Pro — Hệ Thống Báo Cháy Thông Minh</title>
+
+<!-- Google Fonts -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;600;700;800&family=DM+Sans:ital,wght@0,300;0,400;0,500;0,600;1,300&display=swap" rel="stylesheet">
+
+<!-- Material Icons -->
+<link href="https://fonts.googleapis.com/icon?family=Material+Icons+Round" rel="stylesheet">
+
+<link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+
+<!-- ══════════════════════════ FIRE OVERLAY ══════════════════════════ -->
+<div id="fire-overlay" class="hidden">
+  <div class="fire-overlay-bg"></div>
+  <div class="fire-overlay-content">
+    <div class="fire-icon-large">🔥</div>
+    <div class="fire-overlay-title">CẢNH BÁO CHÁY</div>
+    <div class="fire-overlay-location" id="overlay-location">—</div>
+    <div class="fire-overlay-time" id="overlay-time">—</div>
+    <button class="btn-dismiss" onclick="dismissOverlay()">
+      <span class="material-icons-round">check_circle</span> Đã nhận thông báo
+    </button>
+  </div>
+</div>
+
+<!-- ══════════════════════════ SIDEBAR ══════════════════════════════ -->
+<aside class="sidebar">
+  <div class="sidebar-logo">
+    <span class="logo-icon">🔥</span>
+    <div class="logo-text">
+      <span class="logo-name">FireGuard</span>
+      <span class="logo-sub">Pro v2.0</span>
+    </div>
+  </div>
+
+  <nav class="sidebar-nav">
+    <a class="nav-item active" data-page="dashboard" onclick="showPage('dashboard')">
+      <span class="material-icons-round">dashboard</span>
+      <span>Tổng quan</span>
+    </a>
+    <a class="nav-item" data-page="nodes" onclick="showPage('nodes')">
+      <span class="material-icons-round">device_hub</span>
+      <span>Thiết bị</span>
+    </a>
+    <a class="nav-item" data-page="alerts" onclick="showPage('alerts')">
+      <span class="material-icons-round">notifications_active</span>
+      <span>Lịch sử</span>
+      <span class="badge" id="badge-alerts">0</span>
+    </a>
+    <a class="nav-item" data-page="control" onclick="showPage('control')">
+      <span class="material-icons-round">tune</span>
+      <span>Điều khiển</span>
+    </a>
+    <a class="nav-item" data-page="tts" onclick="showPage('tts')">
+      <span class="material-icons-round">record_voice_over</span>
+      <span>TTS / Phát loa</span>
+    </a>
+  </nav>
+
+  <div class="sidebar-status">
+    <div class="ws-indicator" id="ws-dot"></div>
+    <span id="ws-label">Đang kết nối...</span>
+  </div>
+</aside>
+
+<!-- ══════════════════════════ MAIN ═════════════════════════════════ -->
+<main class="main">
+
+  <!-- TOP BAR -->
+  <header class="topbar">
+    <div class="topbar-left">
+      <h1 class="page-title" id="page-title">Tổng quan</h1>
+      <div class="breadcrumb">FireGuard Pro</div>
+    </div>
+    <div class="topbar-right">
+      <div class="system-time" id="system-time">--:--:--</div>
+      <button class="btn-reset" onclick="resetAll()" title="Reset tất cả node">
+        <span class="material-icons-round">refresh</span>
+        Reset All
+      </button>
+    </div>
+  </header>
+
+  <!-- ─── PAGE: DASHBOARD ─────────────────────────────────────────────── -->
+  <section id="page-dashboard" class="page active">
+
+    <!-- Stats row -->
+    <div class="stats-grid">
+      <div class="stat-card">
+        <div class="stat-icon green"><span class="material-icons-round">router</span></div>
+        <div class="stat-body">
+          <div class="stat-value" id="stat-online">0</div>
+          <div class="stat-label">Node online</div>
+        </div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-icon red"><span class="material-icons-round">local_fire_department</span></div>
+        <div class="stat-body">
+          <div class="stat-value" id="stat-fire">0</div>
+          <div class="stat-label">Đang cháy</div>
+        </div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-icon orange"><span class="material-icons-round">history</span></div>
+        <div class="stat-body">
+          <div class="stat-value" id="stat-alerts">0</div>
+          <div class="stat-label">Cảnh báo hôm nay</div>
+        </div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-icon blue"><span class="material-icons-round">schedule</span></div>
+        <div class="stat-body">
+          <div class="stat-value" id="stat-uptime">0h</div>
+          <div class="stat-label">Uptime server</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Node cards -->
+    <div class="section-header">
+      <h2>Trạng thái thiết bị</h2>
+      <span class="section-sub">Cập nhật real-time</span>
+    </div>
+    <div class="node-grid" id="node-grid">
+      <div class="node-empty">
+        <span class="material-icons-round">sensors_off</span>
+        <p>Chưa có thiết bị nào kết nối</p>
+        <small>ESP32 sẽ xuất hiện ở đây khi online</small>
+      </div>
+    </div>
+
+    <!-- Alert feed -->
+    <div class="section-header">
+      <h2>Hoạt động gần đây</h2>
+    </div>
+    <div class="alert-feed" id="alert-feed">
+      <div class="feed-empty">Chưa có sự kiện nào.</div>
+    </div>
+  </section>
+
+  <!-- ─── PAGE: NODES ──────────────────────────────────────────────────── -->
+  <section id="page-nodes" class="page">
+    <div class="section-header">
+      <h2>Quản lý thiết bị</h2>
+      <span class="section-sub">Cấu hình vị trí & nhãn cho từng node</span>
+    </div>
+    <div class="nodes-table-wrap">
+      <table class="nodes-table">
+        <thead>
+          <tr>
+            <th>Loại</th>
+            <th>ID</th>
+            <th>Nhãn</th>
+            <th>Vị trí</th>
+            <th>Khói (ppm)</th>
+            <th>Nhiệt độ</th>
+            <th>Trạng thái</th>
+            <th>Hành động</th>
+          </tr>
+        </thead>
+        <tbody id="nodes-tbody">
+          <tr><td colspan="8" class="tbl-empty">Chưa có thiết bị</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ─── PAGE: ALERTS ─────────────────────────────────────────────────── -->
+  <section id="page-alerts" class="page">
+    <div class="section-header">
+      <h2>Lịch sử cảnh báo</h2>
+      <button class="btn-sm" onclick="clearFeedUI()">
+        <span class="material-icons-round">delete_sweep</span> Xoá hiển thị
+      </button>
+    </div>
+    <div class="alert-log-wrap" id="alert-log-wrap">
+      <div class="feed-empty">Chưa có sự kiện nào.</div>
+    </div>
+  </section>
+
+  <!-- ─── PAGE: CONTROL ────────────────────────────────────────────────── -->
+  <section id="page-control" class="page">
+    <div class="section-header">
+      <h2>Bảng điều khiển thủ công</h2>
+      <span class="section-sub">Kích hoạt còi & loa cho từng khu vực</span>
+    </div>
+
+    <div class="control-grid" id="control-grid">
+      <div class="node-empty">
+        <span class="material-icons-round">sensors_off</span>
+        <p>Chưa có thiết bị sensor nào kết nối</p>
+      </div>
+    </div>
+
+    <!-- Center node remote -->
+    <div class="section-header" style="margin-top:2rem">
+      <h2>Node Trung Tâm — Remote</h2>
+      <span class="section-sub">Mô phỏng 5 nút bấm vật lý trên node trung tâm</span>
+    </div>
+    <div class="remote-wrap">
+      <div class="remote-pad">
+        <button class="remote-btn up" onclick="sendButton('up')" title="UP">
+          <span class="material-icons-round">keyboard_arrow_up</span>
+        </button>
+        <div class="remote-row-mid">
+          <button class="remote-btn left" onclick="sendButton('left')" title="LEFT">
+            <span class="material-icons-round">keyboard_arrow_left</span>
+          </button>
+          <button class="remote-btn ok" onclick="sendButton('ok')" title="OK">
+            <span class="material-icons-round">radio_button_checked</span>
+          </button>
+          <button class="remote-btn right" onclick="sendButton('right')" title="RIGHT">
+            <span class="material-icons-round">keyboard_arrow_right</span>
+          </button>
+        </div>
+        <button class="remote-btn down" onclick="sendButton('down')" title="DOWN">
+          <span class="material-icons-round">keyboard_arrow_down</span>
+        </button>
+      </div>
+      <div class="remote-status" id="remote-status">Nhấn nút để điều khiển màn hình TFT</div>
+    </div>
+  </section>
+
+  <!-- ─── PAGE: TTS ─────────────────────────────────────────────────────── -->
+  <section id="page-tts" class="page">
+    <div class="section-header">
+      <h2>Phát thông báo TTS</h2>
+      <span class="section-sub">Gửi văn bản → chuyển thành giọng nói phát qua loa ESP32</span>
+    </div>
+
+    <div class="tts-card">
+      <label class="tts-label">Chọn thiết bị nhận</label>
+      <select class="tts-select" id="tts-target">
+        <option value="all">📡 Phát tất cả node</option>
+      </select>
+
+      <label class="tts-label" style="margin-top:1.5rem">Nội dung thông báo</label>
+      <textarea class="tts-textarea" id="tts-text" rows="4"
+        placeholder="Nhập nội dung cần phát qua loa..."></textarea>
+
+      <div class="tts-presets">
+        <span class="preset-label">Mẫu nhanh:</span>
+        <button class="preset-btn" onclick="setPreset('Mọi người chú ý! Đây là thông báo kiểm tra hệ thống báo cháy.')">Kiểm tra hệ thống</button>
+        <button class="preset-btn" onclick="setPreset('Cảnh báo! Phát hiện khói tại khu vực. Mọi người hãy sơ tán ngay!')">Cảnh báo khẩn</button>
+        <button class="preset-btn" onclick="setPreset('Tình huống nguy hiểm đã được giải quyết. Mọi người có thể trở lại bình thường.')">All clear</button>
+      </div>
+
+      <button class="btn-send-tts" onclick="sendTTS()">
+        <span class="material-icons-round">send</span>
+        Phát loa ngay
+      </button>
+    </div>
+  </section>
+
+</main>
+
+<!-- ══════════════════════════ MODAL: EDIT NODE ═══════════════════════ -->
+<div id="modal-backdrop" class="modal-backdrop hidden" onclick="closeModal()"></div>
+<div id="modal-edit" class="modal hidden">
+  <div class="modal-header">
+    <h3>Cấu hình thiết bị</h3>
+    <button onclick="closeModal()"><span class="material-icons-round">close</span></button>
+  </div>
+  <input type="hidden" id="modal-node-id">
+  <div class="modal-body">
+    <label class="form-label">Nhãn hiển thị</label>
+    <input class="form-input" id="modal-label" placeholder="VD: Node A - Tầng 1">
+    <label class="form-label" style="margin-top:1rem">Vị trí / Khu vực</label>
+    <input class="form-input" id="modal-location" placeholder="VD: Phòng thí nghiệm A101">
+  </div>
+  <div class="modal-footer">
+    <button class="btn-cancel" onclick="closeModal()">Huỷ</button>
+    <button class="btn-save" onclick="saveNodeConfig()">
+      <span class="material-icons-round">save</span> Lưu
+    </button>
+  </div>
+</div>
+
+<audio id="alert-sound" src="/sounds/alert.mp3" preload="auto"></audio>
+
+<script src="/js/app.js"></script>
+</body>
+</html>
