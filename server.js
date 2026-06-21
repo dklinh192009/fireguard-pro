@@ -12,8 +12,9 @@ const wss    = new WebSocket.Server({ server });
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-// ─── Google TTS ───────────────────────────────────────────────────────────────
-const GOOGLE_TTS_KEY = process.env.GOOGLE_TTS_KEY || '';
+// ─── FPT.AI TTS ───────────────────────────────────────────────────────────────
+const FPT_TTS_KEY = process.env.FPT_TTS_KEY || '';
+const FPT_TTS_VOICE = process.env.FPT_TTS_VOICE || 'banmai'; // banmai = nữ Bắc, có thể đổi minhquang, ngoclam, ...
 
 // ─── In-memory "database" (thay SQLite để tránh lỗi compile trên Render) ──────
 // alertLog: lưu tối đa 500 bản ghi, tự xoá cũ nhất khi đầy
@@ -58,22 +59,46 @@ function getCenterId() {
   return [...nodes.entries()].find(([, n]) => n.info.nodeType === NODE_TYPE.CENTER)?.[0];
 }
 
-// ─── Google TTS ───────────────────────────────────────────────────────────────
-async function fetchGoogleTTS(text) {
-  if (!GOOGLE_TTS_KEY) return null;
-  const url  = `https://texttospeech.googleapis.com/v1/text:synthesize?key=${GOOGLE_TTS_KEY}`;
-  const body = {
-    input: { text },
-    voice: { languageCode: 'vi-VN', name: 'vi-VN-Wavenet-A' },
-    audioConfig: { audioEncoding: 'MP3', speakingRate: 0.95 },
-  };
+// ─── FPT.AI TTS ───────────────────────────────────────────────────────────────
+// FPT.AI trả về 1 LINK (không phải audio trực tiếp), và file cần vài giây để xử lý
+// xong trên server của họ -> phải đợi rồi mới tải link đó về.
+async function fetchFptTTS(text) {
+  if (!FPT_TTS_KEY) return null;
   try {
-    const res  = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    // Bước 1: gọi API để lấy link async
+    const res = await fetch('https://api.fpt.ai/hmi/tts/v5', {
+      method: 'POST',
+      headers: {
+        'api_key': FPT_TTS_KEY,
+        'voice': FPT_TTS_VOICE,
+        'Cache-Control': 'no-cache',
+        'Content-Type': 'text/plain; charset=utf-8',
+      },
+      body: text,
+    });
     const data = await res.json();
-    if (data.audioContent) return Buffer.from(data.audioContent, 'base64');
-    console.error('[TTS] Error:', JSON.stringify(data));
+    if (data.error !== 0 || !data.async) {
+      console.error('[TTS] FPT.AI loi:', JSON.stringify(data));
+      return null;
+    }
+
+    // Bước 2: đợi vài giây để FPT xử lý xong file (đợi theo độ dài văn bản,
+    // tối thiểu 4s, tối đa 15s để tránh treo quá lâu)
+    const waitMs = Math.min(15000, Math.max(4000, text.length * 60));
+    await new Promise((resolve) => setTimeout(resolve, waitMs));
+
+    // Bước 3: tải file mp3 thật từ link async
+    const audioRes = await fetch(data.async);
+    if (!audioRes.ok) {
+      console.error('[TTS] Khong tai duoc file audio tu FPT.AI, status:', audioRes.status);
+      return null;
+    }
+    const arrayBuf = await audioRes.arrayBuffer();
+    return Buffer.from(arrayBuf);
+  } catch (e) {
+    console.error('[TTS]', e.message);
     return null;
-  } catch (e) { console.error('[TTS]', e.message); return null; }
+  }
 }
 
 async function sendTTSToNode(nodeId, text) {
@@ -82,8 +107,8 @@ async function sendTTSToNode(nodeId, text) {
   // Luôn gửi text trước (ESP32 dùng làm fallback)
   sendToNode(nodeId, { type: 'play_tts', text });
   // Nếu có key → gửi thêm audio binary
-  if (GOOGLE_TTS_KEY) {
-    const buf = await fetchGoogleTTS(text);
+  if (FPT_TTS_KEY) {
+    const buf = await fetchFptTTS(text);
     if (buf && node.ws.readyState === WebSocket.OPEN) {
       sendToNode(nodeId, { type: 'tts_audio_start', size: buf.length });
       node.ws.send(buf);
@@ -179,7 +204,7 @@ wss.on('connection', (ws) => {
         browserClients.add(ws);
         ws.send(JSON.stringify({ type: 'nodes_update', nodes: getNodeList() }));
         ws.send(JSON.stringify({ type: 'alert_log', log: dbGetAlerts(50) }));
-        ws.send(JSON.stringify({ type: 'tts_configured', configured: !!GOOGLE_TTS_KEY }));
+        ws.send(JSON.stringify({ type: 'tts_configured', configured: !!FPT_TTS_KEY }));
         break;
       }
 
@@ -279,14 +304,14 @@ app.get('/api/nodes',  (_, res) => res.json(getNodeList()));
 app.get('/api/alerts', (req, res) => res.json(dbGetAlerts(Math.min(parseInt(req.query.limit)||100, 500))));
 app.get('/api/status', (_, res) => res.json({
   nodes: nodes.size, browsers: browserClients.size,
-  alerts: alertLog.length, uptime: process.uptime(), tts: !!GOOGLE_TTS_KEY,
+  alerts: alertLog.length, uptime: process.uptime(), tts: !!FPT_TTS_KEY,
 }));
 
 app.post('/api/tts/preview', async (req, res) => {
   const { text } = req.body;
   if (!text) return res.status(400).json({ error: 'text required' });
-  if (!GOOGLE_TTS_KEY) return res.status(503).json({ error: 'TTS not configured' });
-  const buf = await fetchGoogleTTS(text);
+  if (!FPT_TTS_KEY) return res.status(503).json({ error: 'TTS not configured' });
+  const buf = await fetchFptTTS(text);
   if (!buf) return res.status(500).json({ error: 'TTS failed' });
   res.set('Content-Type', 'audio/mpeg');
   res.send(buf);
@@ -298,5 +323,5 @@ app.get('*', (_, res) => res.sendFile(path.join(__dirname, 'public', 'index.html
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`🔥 FireGuard Pro v2.1 — port ${PORT}`);
-  console.log(`   TTS: ${GOOGLE_TTS_KEY ? '✅ OK' : '❌ No key'}`);
+  console.log(`   TTS: ${FPT_TTS_KEY ? '✅ OK' : '❌ No key'}`);
 });
