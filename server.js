@@ -62,6 +62,9 @@ function getCenterId() {
 // ─── FPT.AI TTS ───────────────────────────────────────────────────────────────
 // FPT.AI trả về 1 LINK (không phải audio trực tiếp), và file cần vài giây để xử lý
 // xong trên server của họ -> phải đợi rồi mới tải link đó về.
+//
+// LƯU Ý QUAN TRỌNG: API yêu cầu đầy đủ các header sau, kể cả "speed" —
+// nếu thiếu hoặc để giá trị rỗng sẽ bị lỗi "is not a legal HTTP header value".
 async function fetchFptTTS(text) {
   if (!FPT_TTS_KEY) return null;
   try {
@@ -69,8 +72,9 @@ async function fetchFptTTS(text) {
     const res = await fetch('https://api.fpt.ai/hmi/tts/v5', {
       method: 'POST',
       headers: {
-        'api_key': FPT_TTS_KEY,
+        'api-key': FPT_TTS_KEY,        // FPT.AI dùng "api-key" (gạch ngang), không phải "api_key"
         'voice': FPT_TTS_VOICE,
+        'speed': '0',                   // bắt buộc phải có giá trị, "0" = tốc độ mặc định
         'Cache-Control': 'no-cache',
         'Content-Type': 'text/plain; charset=utf-8',
       },
