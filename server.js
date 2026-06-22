@@ -128,7 +128,10 @@ async function sendTTSToNode(nodeId, text) {
 
     console.log(`[TTS] Gui audio ${buf.length} bytes -> ${totalChunks} chunks x ${CHUNK_SIZE}B`);
 
-    // Gửi từng chunk, mỗi chunk cách nhau 50ms để ESP32 kịp xử lý
+    // Đợi thêm 300ms sau khi gửi tts_audio_start để ESP32 kịp chuẩn bị buffer
+    await new Promise(r => setTimeout(r, 300));
+
+    // Gửi từng chunk, mỗi chunk cách nhau 200ms để ESP32 kịp xử lý
     for (let i = 0; i < totalChunks; i++) {
       if (node.ws.readyState !== WebSocket.OPEN) {
         console.warn('[TTS] WS dong giua chung, dung gui chunk');
@@ -137,7 +140,8 @@ async function sendTTSToNode(nodeId, text) {
       const start = i * CHUNK_SIZE;
       const end   = Math.min(start + CHUNK_SIZE, buf.length);
       node.ws.send(buf.slice(start, end));
-      await new Promise(r => setTimeout(r, 50)); // delay nhỏ giữa các chunk
+      console.log(`[TTS] Chunk ${i+1}/${totalChunks}: ${end - start} bytes`);
+      await new Promise(r => setTimeout(r, 200)); // tăng lên 200ms giữa mỗi chunk
     }
 
     console.log(`[TTS] Gui xong ${totalChunks} chunks`);
