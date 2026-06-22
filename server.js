@@ -110,13 +110,37 @@ async function sendTTSToNode(nodeId, text) {
   if (!node || node.ws.readyState !== WebSocket.OPEN) return;
   // Luôn gửi text trước (ESP32 dùng làm fallback)
   sendToNode(nodeId, { type: 'play_tts', text });
-  // Nếu có key → gửi thêm audio binary
+  // Nếu có key → gửi thêm audio binary chia nhỏ thành chunk 4KB
   if (FPT_TTS_KEY) {
     const buf = await fetchFptTTS(text);
-    if (buf && node.ws.readyState === WebSocket.OPEN) {
-      sendToNode(nodeId, { type: 'tts_audio_start', size: buf.length });
-      node.ws.send(buf);
+    if (!buf) return;
+    if (node.ws.readyState !== WebSocket.OPEN) return;
+
+    const CHUNK_SIZE = 4096; // 4KB mỗi chunk — phù hợp với buffer WebSocketsClient ESP32
+    const totalChunks = Math.ceil(buf.length / CHUNK_SIZE);
+
+    // Báo trước tổng kích thước và số chunk
+    sendToNode(nodeId, {
+      type: 'tts_audio_start',
+      size: buf.length,
+      chunks: totalChunks,
+    });
+
+    console.log(`[TTS] Gui audio ${buf.length} bytes -> ${totalChunks} chunks x ${CHUNK_SIZE}B`);
+
+    // Gửi từng chunk, mỗi chunk cách nhau 50ms để ESP32 kịp xử lý
+    for (let i = 0; i < totalChunks; i++) {
+      if (node.ws.readyState !== WebSocket.OPEN) {
+        console.warn('[TTS] WS dong giua chung, dung gui chunk');
+        break;
+      }
+      const start = i * CHUNK_SIZE;
+      const end   = Math.min(start + CHUNK_SIZE, buf.length);
+      node.ws.send(buf.slice(start, end));
+      await new Promise(r => setTimeout(r, 50)); // delay nhỏ giữa các chunk
     }
+
+    console.log(`[TTS] Gui xong ${totalChunks} chunks`);
   }
 }
 
