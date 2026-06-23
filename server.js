@@ -60,21 +60,17 @@ function getCenterId() {
 }
 
 // ─── FPT.AI TTS ───────────────────────────────────────────────────────────────
-// FPT.AI trả về 1 LINK (không phải audio trực tiếp), và file cần vài giây để xử lý
-// xong trên server của họ -> phải đợi rồi mới tải link đó về.
-//
-// LƯU Ý QUAN TRỌNG: API yêu cầu đầy đủ các header sau, kể cả "speed" —
-// nếu thiếu hoặc để giá trị rỗng sẽ bị lỗi "is not a legal HTTP header value".
-async function fetchFptTTS(text) {
+// Gọi API FPT.AI để lấy URL file MP3 (async link).
+// KHÔNG tải file về server — chỉ lấy URL rồi gửi cho ESP32 tự tải và phát.
+async function fetchFptTTSUrl(text) {
   if (!FPT_TTS_KEY) return null;
   try {
-    // Bước 1: gọi API để lấy link async
     const res = await fetch('https://api.fpt.ai/hmi/tts/v5', {
       method: 'POST',
       headers: {
-        'api-key': FPT_TTS_KEY,        // FPT.AI dùng "api-key" (gạch ngang), không phải "api_key"
+        'api-key': FPT_TTS_KEY,
         'voice': FPT_TTS_VOICE,
-        'speed': '0',                   // bắt buộc phải có giá trị, "0" = tốc độ mặc định
+        'speed': '0',
         'Cache-Control': 'no-cache',
         'Content-Type': 'text/plain; charset=utf-8',
       },
@@ -85,20 +81,8 @@ async function fetchFptTTS(text) {
       console.error('[TTS] FPT.AI loi:', JSON.stringify(data));
       return null;
     }
-
-    // Bước 2: đợi vài giây để FPT xử lý xong file (đợi theo độ dài văn bản,
-    // tối thiểu 4s, tối đa 15s để tránh treo quá lâu)
-    const waitMs = Math.min(15000, Math.max(4000, text.length * 60));
-    await new Promise((resolve) => setTimeout(resolve, waitMs));
-
-    // Bước 3: tải file mp3 thật từ link async
-    const audioRes = await fetch(data.async);
-    if (!audioRes.ok) {
-      console.error('[TTS] Khong tai duoc file audio tu FPT.AI, status:', audioRes.status);
-      return null;
-    }
-    const arrayBuf = await audioRes.arrayBuffer();
-    return Buffer.from(arrayBuf);
+    console.log('[TTS] URL:', data.async);
+    return data.async; // trả về URL, không tải file
   } catch (e) {
     console.error('[TTS]', e.message);
     return null;
@@ -108,44 +92,22 @@ async function fetchFptTTS(text) {
 async function sendTTSToNode(nodeId, text) {
   const node = nodes.get(nodeId);
   if (!node || node.ws.readyState !== WebSocket.OPEN) return;
-  // Luôn gửi text trước (ESP32 dùng làm fallback)
+
+  // Gửi text trước (ESP32 có thể dùng làm fallback nếu không tải được URL)
   sendToNode(nodeId, { type: 'play_tts', text });
-  // Nếu có key → gửi thêm audio binary chia nhỏ thành chunk 4KB
-  if (FPT_TTS_KEY) {
-    const buf = await fetchFptTTS(text);
-    if (!buf) return;
-    if (node.ws.readyState !== WebSocket.OPEN) return;
 
-    const CHUNK_SIZE = 4096; // 4KB mỗi chunk — phù hợp với buffer WebSocketsClient ESP32
-    const totalChunks = Math.ceil(buf.length / CHUNK_SIZE);
+  if (!FPT_TTS_KEY) return;
 
-    // Báo trước tổng kích thước và số chunk
-    sendToNode(nodeId, {
-      type: 'tts_audio_start',
-      size: buf.length,
-      chunks: totalChunks,
-    });
+  // Lấy URL từ FPT.AI — không tải file về server
+  const url = await fetchFptTTSUrl(text);
+  if (!url) return;
+  if (node.ws.readyState !== WebSocket.OPEN) return;
 
-    console.log(`[TTS] Gui audio ${buf.length} bytes -> ${totalChunks} chunks x ${CHUNK_SIZE}B`);
-
-    // Đợi thêm 300ms sau khi gửi tts_audio_start để ESP32 kịp chuẩn bị buffer
-    await new Promise(r => setTimeout(r, 300));
-
-    // Gửi từng chunk, mỗi chunk cách nhau 200ms để ESP32 kịp xử lý
-    for (let i = 0; i < totalChunks; i++) {
-      if (node.ws.readyState !== WebSocket.OPEN) {
-        console.warn('[TTS] WS dong giua chung, dung gui chunk');
-        break;
-      }
-      const start = i * CHUNK_SIZE;
-      const end   = Math.min(start + CHUNK_SIZE, buf.length);
-      node.ws.send(buf.slice(start, end));
-      console.log(`[TTS] Chunk ${i+1}/${totalChunks}: ${end - start} bytes`);
-      await new Promise(r => setTimeout(r, 200)); // tăng lên 200ms giữa mỗi chunk
-    }
-
-    console.log(`[TTS] Gui xong ${totalChunks} chunks`);
-  }
+  // Gửi URL cho ESP32 tự tải và phát
+  // Đợi 5s để FPT.AI kịp xử lý xong file trước khi ESP32 bắt đầu tải
+  await new Promise(r => setTimeout(r, 5000));
+  sendToNode(nodeId, { type: 'tts_url', url });
+  console.log(`[TTS] Gui URL cho node ${nodeId}`);
 }
 
 function buildTTSText(receiverId, fireNodeInfo) {
