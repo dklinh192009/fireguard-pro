@@ -30,7 +30,6 @@ const userSchema = new mongoose.Schema({
   email:     { type: String, required: true },
   name:      String,
   avatar:    String,
-  // Admin: toàn quyền | Operator: xem + điều khiển | Viewer: chỉ xem
   role:      { type: String, enum: ['admin', 'operator', 'viewer'], default: 'viewer' },
   createdAt: { type: Date, default: Date.now },
   lastLogin: { type: Date, default: Date.now },
@@ -39,7 +38,7 @@ const User = mongoose.model('User', userSchema);
 
 const alertSchema = new mongoose.Schema({
   id:        String,
-  type:      String,   // fire | clear | auto_clear | reset
+  type:      String,
   nodeId:    String,
   label:     String,
   location:  String,
@@ -50,10 +49,10 @@ const alertSchema = new mongoose.Schema({
 const Alert = mongoose.model('Alert', alertSchema);
 
 const nodeConfigSchema = new mongoose.Schema({
-  nodeId:   { type: String, unique: true },
-  label:    String,
-  location: String,
-  nodeType: String,
+  nodeId:    { type: String, unique: true },
+  label:     String,
+  location:  String,
+  nodeType:  String,
   updatedAt: { type: Date, default: Date.now },
 });
 const NodeConfig = mongoose.model('NodeConfig', nodeConfigSchema);
@@ -68,7 +67,7 @@ if (MONGODB_URI) {
   console.warn('[DB] MONGODB_URI not set — using in-memory fallback');
 }
 
-// ─── DB HELPERS (auto fallback sang in-memory nếu chưa có MongoDB) ───────────
+// ─── DB HELPERS ───────────────────────────────────────────────────────────────
 const alertLog    = [];
 const nodesConfig = new Map();
 
@@ -122,16 +121,14 @@ passport.use(new GoogleStrategy({
   callbackURL:  `${BASE_URL}/auth/google/callback`,
 }, async (accessToken, refreshToken, profile, done) => {
   try {
-    const email  = profile.emails?.[0]?.value || '';
-    const role   = email === ADMIN_EMAIL ? 'admin' : 'viewer';
+    const email = profile.emails?.[0]?.value || '';
+    const role  = email === ADMIN_EMAIL ? 'admin' : 'viewer';
 
     let user = await User.findOne({ googleId: profile.id });
     if (user) {
-      // Cập nhật thông tin mỗi lần đăng nhập
       user.lastLogin = new Date();
       user.name      = profile.displayName;
       user.avatar    = profile.photos?.[0]?.value || '';
-      // Admin email luôn giữ role admin dù bị đổi trong DB
       if (email === ADMIN_EMAIL) user.role = 'admin';
       await user.save();
     } else {
@@ -161,27 +158,24 @@ passport.deserializeUser(async (id, done) => {
 // ─── EXPRESS MIDDLEWARE ───────────────────────────────────────────────────────
 app.use(express.json());
 
-// Session lưu vào MongoDB (tồn tại sau restart)
+// ✅ FIX: Dùng MONGODB_URI thay vì mongoConnected (vì Promise chưa resolve tại đây)
 app.use(session({
   secret: SESSION_SECRET,
   resave: false,
   saveUninitialized: false,
-  store: mongoConnected
-    ? MongoStore.create({ mongoUrl: MONGODB_URI, ttl: 7 * 24 * 3600 }) // 7 ngày
+  store: MONGODB_URI
+    ? MongoStore.create({ mongoUrl: MONGODB_URI, ttl: 7 * 24 * 3600 })
     : undefined,
-  cookie: { maxAge: 7 * 24 * 3600 * 1000 }, // 7 ngày
+  cookie: { maxAge: 7 * 24 * 3600 * 1000 },
 }));
 
 app.use(passport.initialize());
 app.use(passport.session());
 
 // ─── AUTH MIDDLEWARE ──────────────────────────────────────────────────────────
-// Bảo vệ tất cả route trừ /login, /auth/*, /health
 function requireAuth(req, res, next) {
-  // Bỏ qua nếu chưa có MongoDB / Google OAuth (development mode)
   if (!MONGODB_URI || !GOOGLE_CLIENT_ID) return next();
   if (req.isAuthenticated()) return next();
-  // API endpoints trả JSON thay vì redirect
   if (req.path.startsWith('/api/') || req.path.startsWith('/ws')) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
@@ -198,30 +192,25 @@ function requireRole(...roles) {
 }
 
 // ─── AUTH ROUTES ──────────────────────────────────────────────────────────────
-// Bắt đầu luồng OAuth
 app.get('/auth/google',
   passport.authenticate('google', { scope: ['profile', 'email'] })
 );
 
-// Callback từ Google
 app.get('/auth/google/callback',
   passport.authenticate('google', { failureRedirect: '/login.html?error=1' }),
   (req, res) => { res.redirect('/'); }
 );
 
-// Đăng xuất
 app.get('/auth/logout', (req, res) => {
   req.logout(() => { res.redirect('/login.html'); });
 });
 
-// API: thông tin user hiện tại (dùng bởi dashboard để hiện avatar/tên)
 app.get('/api/me', (req, res) => {
   if (!req.isAuthenticated()) return res.json({ authenticated: false });
   const { name, email, avatar, role } = req.user;
   res.json({ authenticated: true, name, email, avatar, role });
 });
 
-// API: danh sách users (chỉ Admin)
 app.get('/api/users', requireRole('admin'), async (req, res) => {
   try {
     const users = await User.find().select('-__v').sort({ createdAt: -1 }).lean();
@@ -229,7 +218,6 @@ app.get('/api/users', requireRole('admin'), async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// API: Admin thay đổi role của user khác
 app.patch('/api/users/:id/role', requireRole('admin'), async (req, res) => {
   const { role } = req.body;
   if (!['admin', 'operator', 'viewer'].includes(role))
@@ -241,8 +229,12 @@ app.patch('/api/users/:id/role', requireRole('admin'), async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Static files — login.html không cần auth
-app.use('/login.html', express.static(path.join(__dirname, 'public', 'login.html')));
+// ✅ FIX: Dùng res.sendFile thay vì express.static cho single file
+// express.static() cần nhận DIRECTORY, không nhận FILE path
+// Khi truyền file path, nó không tìm thấy → fall through → requireAuth → redirect loop
+app.get('/login.html', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'login.html'));
+});
 
 // Bảo vệ toàn bộ dashboard
 app.use(requireAuth);
@@ -406,7 +398,12 @@ wss.on('connection', (ws) => {
         const node = nodes.get(msg.nodeId);
         if (!node) break;
         node.info.status = 'normal';
-        const entry = { id: uuidv4(), type: 'clear', nodeId: msg.nodeId, label: node.info.label, location: node.info.location, message: `Hết cháy tại ${node.info.location}`, source: 'auto', timestamp: new Date().toISOString() };
+        const entry = {
+          id: uuidv4(), type: 'clear',
+          nodeId: msg.nodeId, label: node.info.label, location: node.info.location,
+          message: `Hết cháy tại ${node.info.location}`, source: 'auto',
+          timestamp: new Date().toISOString(),
+        };
         await dbLogAlert(entry);
         const cId = getCenterId();
         if (cId) sendToNode(cId, { type: 'lora_broadcast', command: 'BUZZER_OFF' });
@@ -419,7 +416,12 @@ wss.on('connection', (ws) => {
         if (!node) break;
         node.info.status   = 'normal';
         node.info.lastSeen = new Date().toISOString();
-        const entry = { id: uuidv4(), type: 'auto_clear', nodeId: msg.nodeId, label: node.info.label, location: node.info.location, message: `Khói giảm, tự động dừng cảnh báo tại ${node.info.location}`, source: 'auto', timestamp: new Date().toISOString() };
+        const entry = {
+          id: uuidv4(), type: 'auto_clear',
+          nodeId: msg.nodeId, label: node.info.label, location: node.info.location,
+          message: `Khói giảm, tự động dừng cảnh báo tại ${node.info.location}`,
+          source: 'auto', timestamp: new Date().toISOString(),
+        };
         await dbLogAlert(entry);
         broadcastToBrowsers({ type: 'fire_clear', ...entry, nodes: getNodeList() });
         console.log(`[AUTO_CLEAR] ${node.info.label} @ ${node.info.location}`);
@@ -464,7 +466,12 @@ wss.on('connection', (ws) => {
         for (const [id, node] of nodes) { node.info.status = 'normal'; sendToNode(id, { type: 'reset' }); }
         const cId = getCenterId();
         if (cId) sendToNode(cId, { type: 'lora_broadcast', command: 'BUZZER_OFF' });
-        const entry = { id: uuidv4(), type: 'reset', label: 'Dashboard', location: 'Tất cả', message: 'Reset toàn hệ thống từ dashboard', source: 'manual_web', timestamp: new Date().toISOString() };
+        const entry = {
+          id: uuidv4(), type: 'reset',
+          label: 'Dashboard', location: 'Tất cả',
+          message: 'Reset toàn hệ thống từ dashboard',
+          source: 'manual_web', timestamp: new Date().toISOString(),
+        };
         await dbLogAlert(entry);
         broadcastToBrowsers({ type: 'reset_all', nodes: getNodeList(), ...entry });
         break;
@@ -506,7 +513,7 @@ app.get('*', (_, res) => res.sendFile(path.join(__dirname, 'public', 'index.html
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`🔥 FireGuard Pro v2.2 — port ${PORT}`);
-  console.log(`   TTS: ${FPT_TTS_KEY  ? '✅ OK' : '❌ No key'}`);
-  console.log(`   DB:  ${MONGODB_URI  ? '⏳ Connecting...' : '❌ No URI (in-memory)'}`);
-  console.log(`   Auth:${GOOGLE_CLIENT_ID ? ' ✅ Google OAuth' : ' ❌ No OAuth (open access)'}`);
+  console.log(`   TTS:  ${FPT_TTS_KEY      ? '✅ OK'            : '❌ No key'}`);
+  console.log(`   DB:   ${MONGODB_URI      ? '⏳ Connecting...' : '❌ No URI (in-memory)'}`);
+  console.log(`   Auth: ${GOOGLE_CLIENT_ID ? '✅ Google OAuth'  : '❌ No OAuth (open access)'}`);
 });
