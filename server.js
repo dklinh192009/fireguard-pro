@@ -290,6 +290,8 @@ async function vbeeSynthesize(text, timeoutMs = 15000) {
         'Content-Type':  'application/json',
         'Authorization': `Bearer ${VBEE_TOKEN}`,
         'App-Id':        VBEE_APP_ID,
+        'User-Agent':    'FireGuardPro/2.2 (+https://fireguard-pro-uord.onrender.com)',
+        'Accept':        'application/json',
       },
       body: JSON.stringify({
         text,
@@ -301,7 +303,15 @@ async function vbeeSynthesize(text, timeoutMs = 15000) {
         webhookUrl:   `${BASE_URL}/api/tts/callback`,
       }),
     });
-    const data = await res.json();
+
+    const raw = await res.text();               // ✅ đọc raw trước, không parse JSON vội
+    let data;
+    try { data = JSON.parse(raw); }
+    catch {
+      console.error(`[TTS] Vbee tra ve khong phai JSON (status ${res.status}):`, raw.slice(0, 300));
+      return null;
+    }
+
     if (!data.requestId) {
       console.error('[TTS] Vbee loi:', JSON.stringify(data));
       return null;
