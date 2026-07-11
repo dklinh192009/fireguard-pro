@@ -15,8 +15,9 @@ const server = http.createServer(app);
 const wss    = new WebSocket.Server({ server });
 
 // ─── ENV ──────────────────────────────────────────────────────────────────────
-const FPT_TTS_KEY      = process.env.FPT_TTS_KEY          || '';
-const FPT_TTS_VOICE    = process.env.FPT_TTS_VOICE         || 'banmai';
+const VBEE_APP_ID      = process.env.VBEE_APP_ID           || '';
+const VBEE_TOKEN       = process.env.VBEE_TOKEN            || '';
+const VBEE_VOICE_CODE  = process.env.VBEE_VOICE_CODE       || 'hn_female_ngochuyen_full_48k-fhg';
 const MONGODB_URI      = process.env.MONGODB_URI           || '';
 const SESSION_SECRET   = process.env.SESSION_SECRET        || 'fireguard_secret_change_me';
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID      || '';
@@ -235,7 +236,16 @@ app.patch('/api/users/:id/role', requireRole('admin'), async (req, res) => {
 app.get('/login.html', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'login.html'));
 });
-
+app.post('/api/tts/callback', (req, res) => {
+  const { request_id, status, audio_link } = req.body;
+  const pending = pendingTTS.get(request_id);
+  if (pending) {
+    clearTimeout(pending.timer);
+    pendingTTS.delete(request_id);
+    pending.resolve(status === 'SUCCESS' ? audio_link : null);
+  }
+  res.json({ received: true });
+});
 // Bảo vệ toàn bộ dashboard
 app.use(requireAuth);
 app.use(express.static(path.join(__dirname, 'public')));
@@ -268,27 +278,42 @@ function getCenterId() {
   return [...nodes.entries()].find(([, n]) => n.info.nodeType === NODE_TYPE.CENTER)?.[0];
 }
 
-// ─── TTS ──────────────────────────────────────────────────────────────────────
-async function fetchFptTTSUrl(text) {
-  if (!FPT_TTS_KEY) return null;
+// ─── TTS (Vbee) ───────────────────────────────────────────────────────────
+const pendingTTS = new Map(); // requestId -> { resolve, timer }
+
+async function vbeeSynthesize(text, timeoutMs = 15000) {
+  if (!VBEE_TOKEN || !VBEE_APP_ID) return null;
   try {
-    const res = await fetch('https://api.fpt.ai/hmi/tts/v5', {
+    const res = await fetch('https://api.vbee.vn/v1/tts', {
       method: 'POST',
       headers: {
-        'api-key': FPT_TTS_KEY,
-        'voice':   FPT_TTS_VOICE,
-        'speed':   '0',
-        'Cache-Control': 'no-cache',
-        'Content-Type':  'text/plain; charset=utf-8',
+        'Content-Type':  'application/json',
+        'Authorization': `Bearer ${VBEE_TOKEN}`,
+        'App-Id':        VBEE_APP_ID,
       },
-      body: text,
+      body: JSON.stringify({
+        text,
+        mode:         'async',
+        voiceCode:    VBEE_VOICE_CODE,
+        outputFormat: 'mp3',
+        bitrate:      128,
+        speed:        1.0,
+        webhookUrl:   `${BASE_URL}/api/tts/callback`,
+      }),
     });
     const data = await res.json();
-    if (data.error !== 0 || !data.async) {
-      console.error('[TTS] FPT.AI loi:', JSON.stringify(data));
+    if (!data.requestId) {
+      console.error('[TTS] Vbee loi:', JSON.stringify(data));
       return null;
     }
-    return data.async;
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        pendingTTS.delete(data.requestId);
+        console.warn('[TTS] Vbee timeout requestId=' + data.requestId);
+        resolve(null);
+      }, timeoutMs);
+      pendingTTS.set(data.requestId, { resolve, timer });
+    });
   } catch (e) { console.error('[TTS]', e.message); return null; }
 }
 
@@ -296,15 +321,12 @@ async function sendTTSToNode(nodeId, text) {
   const node = nodes.get(nodeId);
   if (!node || node.ws.readyState !== WebSocket.OPEN) return;
   sendToNode(nodeId, { type: 'play_tts', text });
-  if (!FPT_TTS_KEY) return;
-  const url = await fetchFptTTSUrl(text);
+  const url = await vbeeSynthesize(text);
   if (!url) return;
   if (node.ws.readyState !== WebSocket.OPEN) return;
-  await new Promise(r => setTimeout(r, 5000));
   sendToNode(nodeId, { type: 'tts_url', url });
   console.log(`[TTS] Gui URL cho node ${nodeId}`);
 }
-
 function buildTTSText(receiverId, fireNodeInfo) {
   const fireLoc  = fireNodeInfo.location || 'khu vực không xác định';
   const recvInfo = nodes.get(receiverId)?.info;
@@ -377,7 +399,7 @@ wss.on('connection', (ws) => {
         browserClients.add(ws);
         ws.send(JSON.stringify({ type: 'nodes_update',   nodes: getNodeList() }));
         ws.send(JSON.stringify({ type: 'alert_log',      log: await dbGetAlerts(50) }));
-        ws.send(JSON.stringify({ type: 'tts_configured', configured: !!FPT_TTS_KEY }));
+        ws.send(JSON.stringify({ type: 'tts_configured', configured: !!(VBEE_TOKEN && VBEE_APP_ID) }));
         break;
       }
 
@@ -495,14 +517,14 @@ app.get('/api/alerts', async (req, res) => res.json(await dbGetAlerts(Math.min(p
 app.get('/api/status', (_, res) => res.json({
   nodes: nodes.size, browsers: browserClients.size,
   alerts: alertLog.length, uptime: process.uptime(),
-  tts: !!FPT_TTS_KEY, db: mongoConnected,
+  tts: !!(VBEE_TOKEN && VBEE_APP_ID), db: mongoConnected,
 }));
 
 app.post('/api/tts/preview', async (req, res) => {
   const { text } = req.body;
   if (!text) return res.status(400).json({ error: 'text required' });
-  if (!FPT_TTS_KEY) return res.status(503).json({ error: 'TTS not configured' });
-  const url = await fetchFptTTSUrl(text);
+  if (!VBEE_TOKEN || !VBEE_APP_ID) return res.status(503).json({ error: 'TTS not configured' });
+  const url = await vbeeSynthesize(text);
   if (!url) return res.status(500).json({ error: 'TTS failed' });
   res.json({ url });
 });
@@ -513,7 +535,7 @@ app.get('*', (_, res) => res.sendFile(path.join(__dirname, 'public', 'index.html
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`🔥 FireGuard Pro v2.2 — port ${PORT}`);
-  console.log(`   TTS:  ${FPT_TTS_KEY      ? '✅ OK'            : '❌ No key'}`);
+  console.log(`   TTS:  ${(VBEE_TOKEN && VBEE_APP_ID) ? '✅ OK' : '❌ No key'}`);
   console.log(`   DB:   ${MONGODB_URI      ? '⏳ Connecting...' : '❌ No URI (in-memory)'}`);
   console.log(`   Auth: ${GOOGLE_CLIENT_ID ? '✅ Google OAuth'  : '❌ No OAuth (open access)'}`);
 });
