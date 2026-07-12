@@ -9,6 +9,7 @@ const session        = require('express-session');
 const MongoStore     = require('connect-mongo');
 const passport       = require('passport');
 const GoogleStrategy = require('passport-google-oauth20').Strategy;
+const fs             = require('fs');
 
 const app    = express();
 const server = http.createServer(app);
@@ -247,6 +248,11 @@ app.post('/api/tts/callback', (req, res) => {
   res.json({ received: true });
 });
 // Bảo vệ toàn bộ dashboard
+
+const TTS_CACHE_DIR = path.join(__dirname, 'tts-cache');
+fs.mkdirSync(TTS_CACHE_DIR, { recursive: true });
+app.use('/tts-audio', express.static(TTS_CACHE_DIR));
+
 app.use(requireAuth);
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -330,7 +336,23 @@ async function vbeeSynthesize(text, timeoutMs = 20000, pollInterval = 1500) {
       let pollData;
       try { pollData = JSON.parse(pollRaw); } catch { continue; }
 
-      if (pollData.status === 'COMPLETED') return pollData.audioLink || null;
+      if (pollData.status === 'COMPLETED') {
+        const remoteUrl = pollData.audioLink;
+        if (!remoteUrl) return null;
+        try {
+          const audioRes = await fetch(remoteUrl);
+          const buffer   = await audioRes.buffer();
+          const filename = `${uuidv4()}.mp3`;
+          fs.writeFileSync(path.join(TTS_CACHE_DIR, filename), buffer);
+          setTimeout(() => {
+            fs.unlink(path.join(TTS_CACHE_DIR, filename), () => {});
+          }, 2 * 60 * 1000); // tự xoá sau 2 phút
+          return `${BASE_URL}/tts-audio/${filename}`;
+        } catch (e) {
+          console.error('[TTS] Loi tai audio ve cache:', e.message);
+          return remoteUrl; // fallback: thử gửi thẳng link Vbee nếu tải lỗi
+        }
+      }
       if (pollData.status === 'FAILED') {
         console.error('[TTS] Vbee request FAILED:', JSON.stringify(pollData));
         return null;
