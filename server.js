@@ -281,17 +281,16 @@ function getCenterId() {
 // ─── TTS (Vbee) ───────────────────────────────────────────────────────────
 const pendingTTS = new Map(); // requestId -> { resolve, timer }
 
-async function vbeeSynthesize(text, timeoutMs = 15000) {
+async function vbeeSynthesize(text, timeoutMs = 20000, pollInterval = 1500) {
   if (!VBEE_TOKEN || !VBEE_APP_ID) return null;
   try {
+    // Bước 1: Tạo request
     const res = await fetch('https://api.vbee.vn/v1/tts', {
       method: 'POST',
       headers: {
         'Content-Type':  'application/json',
         'Authorization': `Bearer ${VBEE_TOKEN}`,
         'App-Id':        VBEE_APP_ID,
-        'User-Agent':    'FireGuardPro/2.2 (+https://fireguard-pro-uord.onrender.com)',
-        'Accept':        'application/json',
       },
       body: JSON.stringify({
         text,
@@ -300,30 +299,45 @@ async function vbeeSynthesize(text, timeoutMs = 15000) {
         outputFormat: 'mp3',
         bitrate:      128,
         speed:        1.0,
-        webhookUrl:   `${BASE_URL}/api/tts/callback`,
       }),
     });
-
-    const raw = await res.text();               // ✅ đọc raw trước, không parse JSON vội
+    const raw = await res.text();
     let data;
     try { data = JSON.parse(raw); }
     catch {
       console.error(`[TTS] Vbee tra ve khong phai JSON (status ${res.status}):`, raw.slice(0, 300));
       return null;
     }
-
-    if (!data.requestId) {
-      console.error('[TTS] Vbee loi:', JSON.stringify(data));
+    const requestId = data.requestId;
+    if (!requestId) {
+      console.error('[TTS] Vbee loi tao request:', JSON.stringify(data));
       return null;
     }
-    return new Promise((resolve) => {
-      const timer = setTimeout(() => {
-        pendingTTS.delete(data.requestId);
-        console.warn('[TTS] Vbee timeout requestId=' + data.requestId);
-        resolve(null);
-      }, timeoutMs);
-      pendingTTS.set(data.requestId, { resolve, timer });
-    });
+
+    // Bước 2: Poll cho tới khi COMPLETED
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, pollInterval));
+      const pollRes = await fetch(`https://api.vbee.vn/v1/tts/requests/${requestId}`, {
+        headers: {
+          'Authorization': `Bearer ${VBEE_TOKEN}`,
+          'App-Id':        VBEE_APP_ID,
+          'Content-Type':  'application/json',
+        },
+      });
+      const pollRaw = await pollRes.text();
+      let pollData;
+      try { pollData = JSON.parse(pollRaw); } catch { continue; }
+
+      if (pollData.status === 'COMPLETED') return pollData.audioLink || null;
+      if (pollData.status === 'FAILED') {
+        console.error('[TTS] Vbee request FAILED:', JSON.stringify(pollData));
+        return null;
+      }
+      // status === 'PROCESSING' -> vòng lặp tiếp tục poll
+    }
+    console.warn('[TTS] Vbee polling timeout requestId=' + requestId);
+    return null;
   } catch (e) { console.error('[TTS]', e.message); return null; }
 }
 
