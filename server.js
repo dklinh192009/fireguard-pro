@@ -299,6 +299,7 @@ async function vbeeSynthesize(text, timeoutMs = 20000, pollInterval = 1500) {
         outputFormat: 'mp3',
         bitrate:      128,
         speed:        1.0,
+        webhookUrl:   `${BASE_URL}/api/tts/callback`,
       }),
     });
     const raw = await res.text();
