@@ -10,10 +10,13 @@ const MongoStore     = require('connect-mongo');
 const passport       = require('passport');
 const GoogleStrategy = require('passport-google-oauth20').Strategy;
 const fs             = require('fs');
+const admin          = require('firebase-admin');
 
 const app    = express();
 const server = http.createServer(app);
-const wss    = new WebSocket.Server({ server });
+// noServer: true -> tự quản lý bước "upgrade" để có thể đọc session/user
+// TRƯỚC KHI chấp nhận kết nối WebSocket (xem phần gắn session bên dưới)
+const wss    = new WebSocket.Server({ noServer: true });
 
 // ─── ENV ──────────────────────────────────────────────────────────────────────
 const VBEE_APP_ID      = process.env.VBEE_APP_ID           || '';
@@ -25,16 +28,34 @@ const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID      || '';
 const GOOGLE_SECRET    = process.env.GOOGLE_CLIENT_SECRET  || '';
 const BASE_URL         = process.env.BASE_URL              || 'http://localhost:3000';
 const ADMIN_EMAIL      = process.env.ADMIN_EMAIL           || '';
+// Chuỗi JSON của Firebase Service Account, đã encode base64 (xem hướng dẫn lấy ở dưới)
+const FIREBASE_SA_B64  = process.env.FIREBASE_SERVICE_ACCOUNT_BASE64 || '';
+
+// ─── FIREBASE ADMIN (dùng để gửi push notification qua FCM) ───────────────────
+let fcmReady = false;
+if (FIREBASE_SA_B64) {
+  try {
+    const serviceAccount = JSON.parse(Buffer.from(FIREBASE_SA_B64, 'base64').toString('utf8'));
+    admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+    fcmReady = true;
+    console.log('[FCM] Firebase Admin đã khởi tạo');
+  } catch (e) {
+    console.error('[FCM] Lỗi khởi tạo Firebase Admin:', e.message);
+  }
+} else {
+  console.warn('[FCM] Chưa cấu hình FIREBASE_SERVICE_ACCOUNT_BASE64 — push notification sẽ tắt');
+}
 
 // ─── MONGODB SCHEMAS ──────────────────────────────────────────────────────────
 const userSchema = new mongoose.Schema({
-  googleId:  { type: String, required: true, unique: true },
-  email:     { type: String, required: true },
-  name:      String,
-  avatar:    String,
-  role:      { type: String, enum: ['admin', 'operator', 'viewer'], default: 'viewer' },
-  createdAt: { type: Date, default: Date.now },
-  lastLogin: { type: Date, default: Date.now },
+  googleId:   { type: String, required: true, unique: true },
+  email:      { type: String, required: true },
+  name:       String,
+  avatar:     String,
+  role:       { type: String, enum: ['admin', 'operator', 'viewer'], default: 'viewer' },
+  pushTokens: { type: [String], default: [] }, // token thiết bị (app di động/desktop) để gửi FCM
+  createdAt:  { type: Date, default: Date.now },
+  lastLogin:  { type: Date, default: Date.now },
 });
 const User = mongoose.model('User', userSchema);
 
@@ -46,6 +67,7 @@ const alertSchema = new mongoose.Schema({
   location:  String,
   message:   String,
   source:    String,
+  ownerId:   { type: mongoose.Schema.Types.ObjectId, ref: 'User', index: true },
   timestamp: { type: Date, default: Date.now },
 });
 const Alert = mongoose.model('Alert', alertSchema);
@@ -55,9 +77,19 @@ const nodeConfigSchema = new mongoose.Schema({
   label:     String,
   location:  String,
   nodeType:  String,
+  ownerId:   { type: mongoose.Schema.Types.ObjectId, ref: 'User', index: true, default: null },
   updatedAt: { type: Date, default: Date.now },
 });
 const NodeConfig = mongoose.model('NodeConfig', nodeConfigSchema);
+
+// Mã ghép nối thiết bị: user tạo mã -> nhập vào ESP32 -> server gắn quyền sở hữu
+const pairingCodeSchema = new mongoose.Schema({
+  code:      { type: String, required: true, unique: true },
+  ownerId:   { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  used:      { type: Boolean, default: false },
+  createdAt: { type: Date, default: Date.now, expires: 600 }, // tự xoá sau 10 phút (TTL index)
+});
+const PairingCode = mongoose.model('PairingCode', pairingCodeSchema);
 
 // ─── MONGODB CONNECT ──────────────────────────────────────────────────────────
 let mongoConnected = false;
@@ -83,14 +115,39 @@ async function dbLogAlert(entry) {
   return entry;
 }
 
-async function dbGetAlerts(limit = 100) {
+// ownerId=null + isAdmin=true -> trả về tất cả (dùng cho admin)
+async function dbGetAlerts(ownerId, isAdmin, limit = 100) {
   if (mongoConnected) {
     try {
-      const docs = await Alert.find().sort({ timestamp: -1 }).limit(limit).lean();
+      const filter = isAdmin ? {} : { ownerId };
+      const docs = await Alert.find(filter).sort({ timestamp: -1 }).limit(limit).lean();
       return docs.map(d => ({ ...d, id: d.id || d._id.toString(), timestamp: d.timestamp.toISOString() }));
     } catch (e) { console.error('[DB] Alert fetch error:', e.message); }
   }
-  return alertLog.slice(0, limit);
+  if (isAdmin) return alertLog.slice(0, limit);
+  return alertLog.filter(a => String(a.ownerId) === String(ownerId)).slice(0, limit);
+}
+
+// Tạo mã pairing 6 số cho user, hết hạn sau 10 phút
+async function dbCreatePairingCode(ownerId) {
+  let code;
+  do { code = String(Math.floor(100000 + Math.random() * 900000)); }
+  while (await PairingCode.findOne({ code, used: false }).lean());
+  await PairingCode.create({ code, ownerId });
+  return code;
+}
+
+// Kiểm tra mã pairing hợp lệ, đánh dấu đã dùng, trả về ownerId
+async function dbClaimPairingCode(code) {
+  if (!mongoConnected || !code) return null;
+  try {
+    const doc = await PairingCode.findOneAndUpdate(
+      { code, used: false },
+      { used: true },
+      { new: true }
+    );
+    return doc ? doc.ownerId : null;
+  } catch (e) { console.error('[DB] Pairing claim error:', e.message); return null; }
 }
 
 async function dbSaveNodeConfig(nodeId, cfg) {
@@ -161,7 +218,8 @@ passport.deserializeUser(async (id, done) => {
 app.use(express.json());
 
 // ✅ FIX: Dùng MONGODB_URI thay vì mongoConnected (vì Promise chưa resolve tại đây)
-app.use(session({
+// Tách riêng thành biến `sessionMiddleware` để dùng lại được cho WebSocket upgrade bên dưới
+const sessionMiddleware = session({
   secret: SESSION_SECRET,
   resave: false,
   saveUninitialized: false,
@@ -169,10 +227,13 @@ app.use(session({
     ? MongoStore.create({ mongoUrl: MONGODB_URI, ttl: 7 * 24 * 3600 })
     : undefined,
   cookie: { maxAge: 7 * 24 * 3600 * 1000 },
-}));
+});
+app.use(sessionMiddleware);
 
-app.use(passport.initialize());
-app.use(passport.session());
+const passportInit    = passport.initialize();
+const passportSession = passport.session();
+app.use(passportInit);
+app.use(passportSession);
 
 // ─── AUTH MIDDLEWARE ──────────────────────────────────────────────────────────
 function requireAuth(req, res, next) {
@@ -211,6 +272,26 @@ app.get('/api/me', (req, res) => {
   if (!req.isAuthenticated()) return res.json({ authenticated: false });
   const { name, email, avatar, role } = req.user;
   res.json({ authenticated: true, name, email, avatar, role });
+});
+
+// App di động/desktop gọi route này sau khi lấy được FCM token từ thiết bị
+app.post('/api/push-token', requireAuth, async (req, res) => {
+  const { token } = req.body;
+  if (!token) return res.status(400).json({ error: 'token required' });
+  try {
+    await User.updateOne({ _id: req.user._id }, { $addToSet: { pushTokens: token } });
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Gọi khi user đăng xuất trên 1 thiết bị cụ thể, để không nhận push nữa trên máy đó
+app.delete('/api/push-token', requireAuth, async (req, res) => {
+  const { token } = req.body;
+  if (!token) return res.status(400).json({ error: 'token required' });
+  try {
+    await User.updateOne({ _id: req.user._id }, { $pull: { pushTokens: token } });
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/api/users', requireRole('admin'), async (req, res) => {
@@ -261,10 +342,15 @@ const nodes          = new Map();
 const browserClients = new Set();
 const NODE_TYPE      = { CENTER: 'center', SENSOR: 'sensor' };
 
-function broadcastToBrowsers(data) {
+// targetOwnerId=null -> sự kiện hệ thống chung (VD: reset), gửi cho mọi browser đã đăng nhập
+// targetOwnerId='xxx' -> chỉ gửi cho browser của đúng chủ sở hữu node đó (+ admin luôn thấy hết)
+function broadcastToBrowsers(data, targetOwnerId = null) {
   const msg = JSON.stringify(data);
-  for (const c of browserClients)
-    if (c.readyState === WebSocket.OPEN) c.send(msg);
+  for (const c of browserClients) {
+    if (c.readyState !== WebSocket.OPEN) continue;
+    const allowed = c.isAdmin || targetOwnerId === null || String(c.ownerId) === String(targetOwnerId);
+    if (allowed) c.send(msg);
+  }
 }
 
 function sendToNode(nodeId, data) {
@@ -276,8 +362,11 @@ function sendToNode(nodeId, data) {
   return false;
 }
 
-function getNodeList() {
-  return [...nodes.entries()].map(([id, n]) => ({ id, ...n.info, connected: true }));
+// ownerId/isAdmin: nếu isAdmin=true trả về tất cả node, ngược lại chỉ node của user đó
+function getNodeList(ownerId = null, isAdmin = false) {
+  return [...nodes.entries()]
+    .filter(([, n]) => isAdmin || String(n.info.ownerId) === String(ownerId))
+    .map(([id, n]) => ({ id, ...n.info, connected: true }));
 }
 
 function getCenterId() {
@@ -383,20 +472,63 @@ function buildTTSText(receiverId, fireNodeInfo) {
   return `Cảnh báo cháy! Bạn đang ở khu vực ${recvLoc}. Khu vực ${fireLoc} đang có cháy. Mọi người hãy nhanh chóng sơ tán!`;
 }
 
+// ─── PUSH NOTIFICATION (FCM) ────────────────────────────────────────────────
+// Gửi push đến TẤT CẢ thiết bị (điện thoại/desktop) mà user `ownerId` đã đăng ký
+async function sendPushToOwner(ownerId, title, body, data = {}) {
+  if (!fcmReady || !ownerId) return;
+  try {
+    const user = await User.findById(ownerId).lean();
+    const tokens = user?.pushTokens || [];
+    if (tokens.length === 0) return;
+
+    const res = await admin.messaging().sendEachForMulticast({
+      tokens,
+      notification: { title, body },
+      data: Object.fromEntries(Object.entries(data).map(([k, v]) => [k, String(v)])),
+      android: { priority: 'high' },
+      apns: { payload: { aps: { sound: 'default', 'content-available': 1 } } },
+    });
+
+    // Dọn dẹp các token không còn hợp lệ (app đã gỡ cài đặt, token hết hạn...)
+    const deadTokens = [];
+    res.responses.forEach((r, i) => {
+      if (!r.success && ['messaging/invalid-registration-token', 'messaging/registration-token-not-registered'].includes(r.error?.code)) {
+        deadTokens.push(tokens[i]);
+      }
+    });
+    if (deadTokens.length > 0) {
+      await User.updateOne({ _id: ownerId }, { $pullAll: { pushTokens: deadTokens } });
+      console.log(`[FCM] Đã dọn ${deadTokens.length} token chết của user ${ownerId}`);
+    }
+    console.log(`[FCM] Gửi push tới user ${ownerId}: ${res.successCount}/${tokens.length} thành công`);
+  } catch (e) {
+    console.error('[FCM] Lỗi gửi push:', e.message);
+  }
+}
+
 async function handleFireEvent(fireNodeId, source = 'auto') {
   const fireNode = nodes.get(fireNodeId);
   if (!fireNode) { console.warn('[FIRE] Unknown node:', fireNodeId); return; }
   fireNode.info.status = 'fire';
+  const ownerId = fireNode.info.ownerId;
   const entry = {
     id: uuidv4(), type: 'fire',
     nodeId:   fireNodeId,
     label:    fireNode.info.label,
     location: fireNode.info.location,
     message:  `Phát hiện cháy tại ${fireNode.info.location}`,
+    ownerId,
     source, timestamp: new Date().toISOString(),
   };
   await dbLogAlert(entry);
-  broadcastToBrowsers({ type: 'fire_alert', ...entry, nodes: getNodeList() });
+  broadcastToBrowsers({ type: 'fire_alert', ...entry, nodes: getNodeList(ownerId, false) }, ownerId);
+  // Push notification: gửi ngay cả khi app đang tắt hẳn (đúng yêu cầu ban đầu của bạn)
+  sendPushToOwner(
+    ownerId,
+    '🔥 Cảnh báo cháy!',
+    `Phát hiện cháy tại ${fireNode.info.location} (${fireNode.info.label})`,
+    { type: 'fire_alert', nodeId: fireNodeId, location: fireNode.info.location }
+  );
   const centerId = getCenterId();
   if (centerId) sendToNode(centerId, { type: 'lora_broadcast', command: 'BUZZER_ON', fireNodeId, location: fireNode.info.location });
   for (const [id, node] of nodes) {
@@ -407,10 +539,28 @@ async function handleFireEvent(fireNodeId, source = 'auto') {
   console.log(`[FIRE] ${source} — ${fireNode.info.label} @ ${fireNode.info.location}`);
 }
 
+// ─── WEBSOCKET UPGRADE (xác thực user TRƯỚC khi accept kết nối) ───────────────
+// Node/ESP32 không gửi cookie session -> req.user sẽ là undefined, coi là "device"
+// Browser đã đăng nhập -> cookie session hợp lệ -> req.user chứa thông tin user
+server.on('upgrade', (req, socket, head) => {
+  sessionMiddleware(req, {}, () => {
+    passportInit(req, {}, () => {
+      passportSession(req, {}, () => {
+        wss.handleUpgrade(req, socket, head, (ws) => {
+          wss.emit('connection', ws, req);
+        });
+      });
+    });
+  });
+});
+
 // ─── WEBSOCKET ────────────────────────────────────────────────────────────────
-wss.on('connection', (ws) => {
+wss.on('connection', (ws, req) => {
   let clientType = null;
   let nodeId     = null;
+  // req.user chỉ tồn tại nếu trình duyệt đã đăng nhập (ESP32 sẽ không có)
+  const wsUser   = req.user || null;
+  const isAdmin  = wsUser?.role === 'admin';
 
   ws.on('message', async (raw) => {
     if (Buffer.isBuffer(raw) && raw[0] !== 0x7b) return;
@@ -422,11 +572,30 @@ wss.on('connection', (ws) => {
       case 'register': {
         clientType = 'node';
         nodeId     = msg.nodeId || uuidv4();
-        const saved = await dbGetNodeConfig(nodeId);
+        let saved  = await dbGetNodeConfig(nodeId);
+
+        // Node chưa có chủ (ownerId null/chưa tồn tại) -> thử claim bằng pairing code
+        if (!saved?.ownerId && msg.pairingCode) {
+          const claimedOwnerId = await dbClaimPairingCode(msg.pairingCode);
+          if (claimedOwnerId) {
+            await dbSaveNodeConfig(nodeId, {
+              ownerId:  claimedOwnerId,
+              nodeType: saved?.nodeType || msg.nodeType || NODE_TYPE.SENSOR,
+              label:    saved?.label    || msg.label    || `Node-${nodeId.slice(0,4)}`,
+              location: saved?.location || msg.location || 'Chưa cấu hình',
+            });
+            saved = await dbGetNodeConfig(nodeId);
+            console.log(`[PAIR] Node ${nodeId} đã ghép với user ${claimedOwnerId}`);
+          } else {
+            console.warn(`[PAIR] Mã pairing không hợp lệ/hết hạn cho node ${nodeId}`);
+          }
+        }
+
         nodes.set(nodeId, {
           ws,
           info: {
             nodeId,
+            ownerId:  saved?.ownerId || null,
             nodeType: saved?.nodeType || msg.nodeType || NODE_TYPE.SENSOR,
             label:    saved?.label    || msg.label    || `Node-${nodeId.slice(0,4)}`,
             location: saved?.location || msg.location || 'Chưa cấu hình',
@@ -435,17 +604,27 @@ wss.on('connection', (ws) => {
           },
         });
         const info = nodes.get(nodeId).info;
-        ws.send(JSON.stringify({ type: 'registered', nodeId, label: info.label, location: info.location, nodeType: info.nodeType }));
-        broadcastToBrowsers({ type: 'nodes_update', nodes: getNodeList() });
-        console.log(`[REG] ${nodeId} (${info.label}) ${info.nodeType}`);
+        ws.send(JSON.stringify({
+          type: 'registered', nodeId, label: info.label, location: info.location,
+          nodeType: info.nodeType, claimed: !!info.ownerId,
+        }));
+        broadcastToBrowsers({ type: 'nodes_update', nodes: getNodeList() }, info.ownerId);
+        console.log(`[REG] ${nodeId} (${info.label}) ${info.nodeType} owner=${info.ownerId || 'chưa ghép'}`);
         break;
       }
 
       case 'browser_connect': {
         clientType = 'browser';
+        // Chưa đăng nhập (và server đang bật auth) -> không cho nghe dữ liệu
+        if (!wsUser && MONGODB_URI && GOOGLE_CLIENT_ID) {
+          ws.send(JSON.stringify({ type: 'error', message: 'Unauthorized' }));
+          break;
+        }
+        ws.ownerId = wsUser ? String(wsUser._id) : null;
+        ws.isAdmin = isAdmin;
         browserClients.add(ws);
-        ws.send(JSON.stringify({ type: 'nodes_update',   nodes: getNodeList() }));
-        ws.send(JSON.stringify({ type: 'alert_log',      log: await dbGetAlerts(50) }));
+        ws.send(JSON.stringify({ type: 'nodes_update',   nodes: getNodeList(ws.ownerId, ws.isAdmin) }));
+        ws.send(JSON.stringify({ type: 'alert_log',      log: await dbGetAlerts(ws.ownerId, ws.isAdmin, 50) }));
         ws.send(JSON.stringify({ type: 'tts_configured', configured: !!(VBEE_TOKEN && VBEE_APP_ID) }));
         break;
       }
@@ -456,7 +635,7 @@ wss.on('connection', (ws) => {
         node.info.smoke    = msg.smoke ?? node.info.smoke;
         node.info.temp     = msg.temp  ?? node.info.temp;
         node.info.lastSeen = new Date().toISOString();
-        broadcastToBrowsers({ type: 'sensor_update', nodeId: msg.nodeId, smoke: node.info.smoke, temp: node.info.temp });
+        broadcastToBrowsers({ type: 'sensor_update', nodeId: msg.nodeId, smoke: node.info.smoke, temp: node.info.temp }, node.info.ownerId);
         break;
       }
 
@@ -471,12 +650,12 @@ wss.on('connection', (ws) => {
           id: uuidv4(), type: 'clear',
           nodeId: msg.nodeId, label: node.info.label, location: node.info.location,
           message: `Hết cháy tại ${node.info.location}`, source: 'auto',
-          timestamp: new Date().toISOString(),
+          ownerId: node.info.ownerId, timestamp: new Date().toISOString(),
         };
         await dbLogAlert(entry);
         const cId = getCenterId();
         if (cId) sendToNode(cId, { type: 'lora_broadcast', command: 'BUZZER_OFF' });
-        broadcastToBrowsers({ type: 'fire_clear', ...entry, nodes: getNodeList() });
+        broadcastToBrowsers({ type: 'fire_clear', ...entry, nodes: getNodeList(node.info.ownerId, false) }, node.info.ownerId);
         break;
       }
 
@@ -489,34 +668,47 @@ wss.on('connection', (ws) => {
           id: uuidv4(), type: 'auto_clear',
           nodeId: msg.nodeId, label: node.info.label, location: node.info.location,
           message: `Khói giảm, tự động dừng cảnh báo tại ${node.info.location}`,
-          source: 'auto', timestamp: new Date().toISOString(),
+          source: 'auto', ownerId: node.info.ownerId, timestamp: new Date().toISOString(),
         };
         await dbLogAlert(entry);
-        broadcastToBrowsers({ type: 'fire_clear', ...entry, nodes: getNodeList() });
+        broadcastToBrowsers({ type: 'fire_clear', ...entry, nodes: getNodeList(node.info.ownerId, false) }, node.info.ownerId);
         console.log(`[AUTO_CLEAR] ${node.info.label} @ ${node.info.location}`);
         break;
       }
 
-      case 'manual_alert':
-        await handleFireEvent(msg.targetNodeId, msg.source || 'manual_web'); break;
+      case 'manual_alert': {
+        const targetNode = nodes.get(msg.targetNodeId);
+        if (!targetNode) break;
+        if (!isAdmin && String(targetNode.info.ownerId) !== String(wsUser?._id)) break; // không phải chủ -> bỏ qua
+        await handleFireEvent(msg.targetNodeId, msg.source || 'manual_web');
+        break;
+      }
 
       case 'send_tts': {
+        const ownsNode = (n) => isAdmin || String(n.info.ownerId) === String(wsUser?._id);
         if (msg.targetNodeId === 'all') {
           for (const [id, node] of nodes) {
             if (node.info.nodeType === NODE_TYPE.CENTER) continue;
+            if (!ownsNode(node)) continue;
             await sendTTSToNode(id, msg.text);
           }
         } else {
-          await sendTTSToNode(msg.targetNodeId, msg.text);
+          const node = nodes.get(msg.targetNodeId);
+          if (node && ownsNode(node)) await sendTTSToNode(msg.targetNodeId, msg.text);
         }
         break;
       }
 
-      case 'button_press':
-        broadcastToBrowsers({ type: 'button_press', button: msg.button, nodeId: msg.nodeId }); break;
+      case 'button_press': {
+        const btnNode = nodes.get(msg.nodeId);
+        broadcastToBrowsers({ type: 'button_press', button: msg.button, nodeId: msg.nodeId }, btnNode?.info.ownerId);
+        break;
+      }
 
       case 'update_node': {
         const node = nodes.get(msg.nodeId);
+        // Chỉ cho sửa node của chính mình (trừ admin)
+        if (node && !isAdmin && String(node.info.ownerId) !== String(wsUser?._id)) break;
         if (node) {
           if (msg.label)    node.info.label    = msg.label;
           if (msg.location) node.info.location = msg.location;
@@ -526,23 +718,30 @@ wss.on('connection', (ws) => {
           label:    msg.label    || node?.info.label,
           location: msg.location || node?.info.location,
           nodeType: msg.nodeType || node?.info.nodeType || 'sensor',
+          ownerId:  node?.info.ownerId,
         });
-        broadcastToBrowsers({ type: 'nodes_update', nodes: getNodeList() });
+        broadcastToBrowsers({ type: 'nodes_update', nodes: getNodeList(node?.info.ownerId, false) }, node?.info.ownerId);
         break;
       }
 
       case 'reset_all': {
-        for (const [id, node] of nodes) { node.info.status = 'normal'; sendToNode(id, { type: 'reset' }); }
+        // Chỉ reset các node thuộc về user đang gọi (admin reset được tất cả)
+        for (const [id, node] of nodes) {
+          if (!isAdmin && String(node.info.ownerId) !== String(wsUser?._id)) continue;
+          node.info.status = 'normal';
+          sendToNode(id, { type: 'reset' });
+        }
         const cId = getCenterId();
         if (cId) sendToNode(cId, { type: 'lora_broadcast', command: 'BUZZER_OFF' });
+        const ownerId = isAdmin ? null : String(wsUser?._id);
         const entry = {
           id: uuidv4(), type: 'reset',
           label: 'Dashboard', location: 'Tất cả',
           message: 'Reset toàn hệ thống từ dashboard',
-          source: 'manual_web', timestamp: new Date().toISOString(),
+          source: 'manual_web', ownerId, timestamp: new Date().toISOString(),
         };
         await dbLogAlert(entry);
-        broadcastToBrowsers({ type: 'reset_all', nodes: getNodeList(), ...entry });
+        broadcastToBrowsers({ type: 'reset_all', nodes: getNodeList(ownerId, isAdmin), ...entry }, ownerId);
         break;
       }
     }
@@ -559,8 +758,24 @@ wss.on('connection', (ws) => {
 });
 
 // ─── REST API ─────────────────────────────────────────────────────────────────
-app.get('/api/nodes',  (_, res) => res.json(getNodeList()));
-app.get('/api/alerts', async (req, res) => res.json(await dbGetAlerts(Math.min(parseInt(req.query.limit)||100, 500))));
+app.get('/api/nodes', (req, res) => {
+  const isAdmin = req.user?.role === 'admin';
+  res.json(getNodeList(req.user?._id, isAdmin));
+});
+app.get('/api/alerts', async (req, res) => {
+  const isAdmin = req.user?.role === 'admin';
+  const limit   = Math.min(parseInt(req.query.limit) || 100, 500);
+  res.json(await dbGetAlerts(req.user?._id, isAdmin, limit));
+});
+
+// Tạo mã pairing 6 số để ghép thiết bị ESP32 mới với tài khoản đang đăng nhập
+app.post('/api/pairing-code', requireRole('admin', 'operator'), async (req, res) => {
+  if (!mongoConnected) return res.status(503).json({ error: 'Cần MongoDB để dùng tính năng ghép thiết bị' });
+  try {
+    const code = await dbCreatePairingCode(req.user._id);
+    res.json({ code, expiresInSeconds: 600 });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 app.get('/api/status', (_, res) => res.json({
   nodes: nodes.size, browsers: browserClients.size,
   alerts: alertLog.length, uptime: process.uptime(),
@@ -585,4 +800,5 @@ server.listen(PORT, () => {
   console.log(`   TTS:  ${(VBEE_TOKEN && VBEE_APP_ID) ? '✅ OK' : '❌ No key'}`);
   console.log(`   DB:   ${MONGODB_URI      ? '⏳ Connecting...' : '❌ No URI (in-memory)'}`);
   console.log(`   Auth: ${GOOGLE_CLIENT_ID ? '✅ Google OAuth'  : '❌ No OAuth (open access)'}`);
+  console.log(`   FCM:  ${fcmReady ? '✅ Push notification bật' : '❌ Chưa cấu hình'}`);
 });
