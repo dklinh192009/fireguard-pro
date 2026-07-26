@@ -381,6 +381,46 @@ function closeModal() {
   document.getElementById('modal-edit').classList.add('hidden');
 }
 
+// Đóng bất kỳ modal nào đang mở khi bấm ra ngoài backdrop
+function closeAnyModal() {
+  if (!document.getElementById('modal-pairing').classList.contains('hidden')) closePairingModal();
+  else closeModal();
+}
+
+// ─── Pairing (ghép nối thiết bị mới) ─────────────────────────
+async function requestPairingCode() {
+  const modal   = document.getElementById('modal-pairing');
+  const display = document.getElementById('pairing-code-display');
+  const status  = document.getElementById('pairing-code-status');
+  document.getElementById('modal-backdrop').classList.remove('hidden');
+  modal.classList.remove('hidden');
+  display.textContent = '------';
+  status.textContent = 'Đang tạo mã...';
+  try {
+    const res = await fetch('/api/pairing-code', { method: 'POST' });
+    const data = await res.json();
+    if (!res.ok) { status.textContent = data.error || 'Lỗi tạo mã'; return; }
+    display.textContent = data.code;
+    let remaining = data.expiresInSeconds;
+    status.textContent = `Hết hạn sau ${remaining}s`;
+    const timer = setInterval(() => {
+      remaining--;
+      if (remaining <= 0) { status.textContent = 'Mã đã hết hạn'; clearInterval(timer); return; }
+      status.textContent = `Hết hạn sau ${remaining}s`;
+    }, 1000);
+    modal.dataset.timerId = timer;
+  } catch (e) {
+    status.textContent = 'Lỗi kết nối server';
+  }
+}
+
+function closePairingModal() {
+  const modal = document.getElementById('modal-pairing');
+  if (modal.dataset.timerId) clearInterval(Number(modal.dataset.timerId));
+  modal.classList.add('hidden');
+  document.getElementById('modal-backdrop').classList.add('hidden');
+}
+
 function saveNodeConfig() {
   const nodeId = document.getElementById('modal-node-id').value;
   const label = document.getElementById('modal-label').value.trim();
