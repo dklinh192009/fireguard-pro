@@ -54,6 +54,11 @@ const userSchema = new mongoose.Schema({
   avatar:     String,
   role:       { type: String, enum: ['admin', 'operator', 'viewer'], default: 'viewer' },
   pushTokens: { type: [String], default: [] }, // token thiết bị (app di động/desktop) để gửi FCM
+  // Ngưỡng ppm mặc định áp dụng cho MỌI node của user, trừ khi node đó có thresholdOverride riêng
+  alertThresholds: {
+    warn:   { type: Number, default: 150 }, // bắt đầu "cảnh báo sớm" (cam)
+    danger: { type: Number, default: 400 }, // bắt đầu "nguy hiểm/cháy" (đỏ)
+  },
   createdAt:  { type: Date, default: Date.now },
   lastLogin:  { type: Date, default: Date.now },
 });
@@ -78,6 +83,11 @@ const nodeConfigSchema = new mongoose.Schema({
   location:  String,
   nodeType:  String,
   ownerId:   { type: mongoose.Schema.Types.ObjectId, ref: 'User', index: true, default: null },
+  // Ghi đè ngưỡng riêng cho node này; null = dùng ngưỡng mặc định của user (alertThresholds)
+  thresholdOverride: {
+    type: new mongoose.Schema({ warn: Number, danger: Number }, { _id: false }),
+    default: null,
+  },
   updatedAt: { type: Date, default: Date.now },
 });
 const NodeConfig = mongoose.model('NodeConfig', nodeConfigSchema);
@@ -270,8 +280,34 @@ app.get('/auth/logout', (req, res) => {
 
 app.get('/api/me', (req, res) => {
   if (!req.isAuthenticated()) return res.json({ authenticated: false });
-  const { name, email, avatar, role } = req.user;
-  res.json({ authenticated: true, name, email, avatar, role });
+  const { name, email, avatar, role, alertThresholds } = req.user;
+  res.json({ authenticated: true, name, email, avatar, role, alertThresholds });
+});
+
+// Đổi ngưỡng ppm mặc định cho toàn bộ node của user (trừ node đã có thresholdOverride riêng)
+app.patch('/api/settings/thresholds', requireAuth, async (req, res) => {
+  const { warn, danger } = req.body;
+  if (typeof warn !== 'number' || typeof danger !== 'number' || warn >= danger) {
+    return res.status(400).json({ error: 'warn/danger phải là số, và warn < danger' });
+  }
+  await User.updateOne({ _id: req.user._id }, { alertThresholds: { warn, danger } });
+  res.json({ success: true, alertThresholds: { warn, danger } });
+});
+
+// Ghi đè ngưỡng riêng cho 1 node cụ thể (VD: node đặt trong bếp cần ngưỡng cao hơn)
+// Gửi body = {} hoặc {warn:null, danger:null} để xoá override, quay về dùng ngưỡng mặc định của user
+app.patch('/api/nodes/:nodeId/threshold', requireAuth, async (req, res) => {
+  const { warn, danger } = req.body;
+  const cfg = await dbGetNodeConfig(req.params.nodeId);
+  if (!cfg) return res.status(404).json({ error: 'Không tìm thấy node' });
+  if (req.user.role !== 'admin' && String(cfg.ownerId) !== String(req.user._id)) {
+    return res.status(403).json({ error: 'Không phải chủ sở hữu node này' });
+  }
+  const override = (typeof warn === 'number' && typeof danger === 'number') ? { warn, danger } : null;
+  await dbSaveNodeConfig(req.params.nodeId, { thresholdOverride: override });
+  const live = nodes.get(req.params.nodeId);
+  if (live) live.info.thresholdOverride = override;
+  res.json({ success: true, thresholdOverride: override });
 });
 
 // App di động/desktop gọi route này sau khi lấy được FCM token từ thiết bị
@@ -599,6 +635,7 @@ wss.on('connection', (ws, req) => {
             nodeType: saved?.nodeType || msg.nodeType || NODE_TYPE.SENSOR,
             label:    saved?.label    || msg.label    || `Node-${nodeId.slice(0,4)}`,
             location: saved?.location || msg.location || 'Chưa cấu hình',
+            thresholdOverride: saved?.thresholdOverride || null, // null = dùng ngưỡng mặc định của user
             status: 'normal', lastSeen: new Date().toISOString(),
             smoke: 0, temp: 0,
           },
@@ -775,6 +812,53 @@ app.post('/api/pairing-code', requireRole('admin', 'operator'), async (req, res)
     const code = await dbCreatePairingCode(req.user._id);
     res.json({ code, expiresInSeconds: 600 });
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Admin đổi thẳng chủ sở hữu node bằng email người mới
+app.patch('/api/nodes/:nodeId/owner', requireRole('admin'), async (req, res) => {
+  const { newOwnerEmail } = req.body;
+  const targetUser = await User.findOne({ email: newOwnerEmail }).lean();
+  if (!targetUser) return res.status(404).json({ error: 'Không tìm thấy user với email này' });
+  await dbSaveNodeConfig(req.params.nodeId, { ownerId: targetUser._id });
+  const live = nodes.get(req.params.nodeId);
+  if (live) live.info.ownerId = targetUser._id;
+  broadcastToBrowsers({ type: 'nodes_update', nodes: getNodeList(null, true) }, null); // báo lại cho mọi admin
+  res.json({ success: true, newOwnerId: targetUser._id });
+});
+
+// Chủ hiện tại (hoặc admin) "nhả" node ra -> node về trạng thái chưa ai sở hữu
+app.post('/api/nodes/:nodeId/release', requireAuth, async (req, res) => {
+  const cfg = await dbGetNodeConfig(req.params.nodeId);
+  if (!cfg) return res.status(404).json({ error: 'Không tìm thấy node' });
+  const isOwner = String(cfg.ownerId) === String(req.user._id);
+  if (!isOwner && req.user.role !== 'admin') return res.status(403).json({ error: 'Không phải chủ sở hữu node này' });
+
+  const oldOwnerId = cfg.ownerId;
+  await dbSaveNodeConfig(req.params.nodeId, { ownerId: null });
+  const live = nodes.get(req.params.nodeId);
+  if (live) live.info.ownerId = null;
+  broadcastToBrowsers({ type: 'nodes_update', nodes: getNodeList(oldOwnerId, false) }, oldOwnerId); // node biến mất khỏi màn hình chủ cũ
+  res.json({ success: true });
+});
+
+// User đang đăng nhập tự nhận 1 node đang "chưa ai sở hữu" bằng mã pairing của chính họ
+app.post('/api/nodes/:nodeId/claim', requireAuth, async (req, res) => {
+  const { code } = req.body;
+  const cfg = await dbGetNodeConfig(req.params.nodeId);
+  if (!cfg) return res.status(404).json({ error: 'Không tìm thấy node' });
+  if (cfg.ownerId) return res.status(409).json({ error: 'Node này đã có chủ sở hữu, cần release trước' });
+
+  const pairing = await PairingCode.findOneAndUpdate(
+    { code, used: false, ownerId: req.user._id },
+    { used: true }, { new: true }
+  );
+  if (!pairing) return res.status(400).json({ error: 'Mã pairing không hợp lệ, hết hạn, hoặc không phải của bạn' });
+
+  await dbSaveNodeConfig(req.params.nodeId, { ownerId: req.user._id });
+  const live = nodes.get(req.params.nodeId);
+  if (live) live.info.ownerId = req.user._id;
+  broadcastToBrowsers({ type: 'nodes_update', nodes: getNodeList(req.user._id, false) }, req.user._id);
+  res.json({ success: true });
 });
 app.get('/api/status', (_, res) => res.json({
   nodes: nodes.size, browsers: browserClients.size,
