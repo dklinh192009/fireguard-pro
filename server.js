@@ -11,6 +11,16 @@ const passport       = require('passport');
 const GoogleStrategy = require('passport-google-oauth20').Strategy;
 const fs             = require('fs');
 const admin          = require('firebase-admin');
+const jwt            = require('jsonwebtoken');
+
+// Token dùng RIÊNG cho app di động/desktop (web vẫn dùng session cookie như cũ)
+function signMobileToken(user) {
+  return jwt.sign(
+    { _id: String(user._id), email: user.email, name: user.name, avatar: user.avatar, role: user.role },
+    SESSION_SECRET,
+    { expiresIn: '30d' } // Token sống 30 ngày, người dùng không phải đăng nhập lại liên tục
+  );
+}
 
 const app    = express();
 const server = http.createServer(app);
@@ -53,6 +63,9 @@ const userSchema = new mongoose.Schema({
   name:       String,
   avatar:     String,
   role:       { type: String, enum: ['admin', 'operator', 'viewer'], default: 'viewer' },
+  // null = đây là 1 "chủ hệ thống" độc lập. Có giá trị = "khách" được mời,
+  // mọi dữ liệu họ xem là dữ liệu của user có _id này (không phải của chính họ)
+  belongsToOwnerId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
   pushTokens: { type: [String], default: [] }, // token thiết bị (app di động/desktop) để gửi FCM
   // Ngưỡng ppm mặc định áp dụng cho MỌI node của user, trừ khi node đó có thresholdOverride riêng
   alertThresholds: {
@@ -100,6 +113,21 @@ const pairingCodeSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now, expires: 600 }, // tự xoá sau 10 phút (TTL index)
 });
 const PairingCode = mongoose.model('PairingCode', pairingCodeSchema);
+
+// Trả về "chủ hệ thống thật sự" của 1 user — nếu là khách được mời thì trả về id của người mời họ
+function tenantIdOf(user) {
+  return user?.belongsToOwnerId || user?._id;
+}
+
+// Mã mời người (khác PairingCode là mã ghép THIẾT BỊ) — chủ hệ thống tạo mã này để mời thành viên gia đình
+const inviteCodeSchema = new mongoose.Schema({
+  code:      { type: String, required: true, unique: true },
+  ownerId:   { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  role:      { type: String, enum: ['operator', 'viewer'], default: 'viewer' }, // quyền của người được mời
+  used:      { type: Boolean, default: false },
+  createdAt: { type: Date, default: Date.now, expires: 3600 }, // hết hạn sau 1 giờ
+});
+const InviteCode = mongoose.model('InviteCode', inviteCodeSchema);
 
 // ─── MONGODB CONNECT ──────────────────────────────────────────────────────────
 let mongoConnected = false;
@@ -245,6 +273,22 @@ const passportSession = passport.session();
 app.use(passportInit);
 app.use(passportSession);
 
+// App di động gửi kèm header "Authorization: Bearer <token>" thay vì cookie.
+// Nếu web đã có session rồi thì bỏ qua (ưu tiên session), chỉ dùng token khi CHƯA có session.
+function attachTokenAuth(req, res, next) {
+  if (req.isAuthenticated()) return next();
+  const authHeader = req.headers.authorization;
+  if (authHeader?.startsWith('Bearer ')) {
+    try {
+      const payload = jwt.verify(authHeader.slice(7), SESSION_SECRET);
+      req.user = payload;
+      req.isAuthenticated = () => true;
+    } catch (e) { /* token sai/hết hạn -> coi như chưa đăng nhập, không chặn ở đây */ }
+  }
+  next();
+}
+app.use(attachTokenAuth);
+
 // ─── AUTH MIDDLEWARE ──────────────────────────────────────────────────────────
 function requireAuth(req, res, next) {
   if (!MONGODB_URI || !GOOGLE_CLIENT_ID) return next();
@@ -269,9 +313,21 @@ app.get('/auth/google',
   passport.authenticate('google', { scope: ['profile', 'email'] })
 );
 
+// App di động gọi route này thay vì /auth/google — thêm state=mobile để callback biết đường trả token
+app.get('/auth/google/mobile',
+  passport.authenticate('google', { scope: ['profile', 'email'], state: 'mobile' })
+);
+
 app.get('/auth/google/callback',
   passport.authenticate('google', { failureRedirect: '/login.html?error=1' }),
-  (req, res) => { res.redirect('/'); }
+  (req, res) => {
+    if (req.query.state === 'mobile') {
+      // Deep link quay lại app: fireguardapp://auth-callback?token=xxx
+      const token = signMobileToken(req.user);
+      return res.redirect(`fireguardapp://auth-callback?token=${token}`);
+    }
+    res.redirect('/');
+  }
 );
 
 app.get('/auth/logout', (req, res) => {
@@ -296,11 +352,11 @@ app.patch('/api/settings/thresholds', requireAuth, async (req, res) => {
 
 // Ghi đè ngưỡng riêng cho 1 node cụ thể (VD: node đặt trong bếp cần ngưỡng cao hơn)
 // Gửi body = {} hoặc {warn:null, danger:null} để xoá override, quay về dùng ngưỡng mặc định của user
-app.patch('/api/nodes/:nodeId/threshold', requireAuth, async (req, res) => {
+app.patch('/api/nodes/:nodeId/threshold', requireRole('admin', 'operator'), async (req, res) => {
   const { warn, danger } = req.body;
   const cfg = await dbGetNodeConfig(req.params.nodeId);
   if (!cfg) return res.status(404).json({ error: 'Không tìm thấy node' });
-  if (req.user.role !== 'admin' && String(cfg.ownerId) !== String(req.user._id)) {
+  if (req.user.role !== 'admin' && String(cfg.ownerId) !== String(tenantIdOf(req.user))) {
     return res.status(403).json({ error: 'Không phải chủ sở hữu node này' });
   }
   const override = (typeof warn === 'number' && typeof danger === 'number') ? { warn, danger } : null;
@@ -582,6 +638,14 @@ server.on('upgrade', (req, socket, head) => {
   sessionMiddleware(req, {}, () => {
     passportInit(req, {}, () => {
       passportSession(req, {}, () => {
+        // Web đăng nhập qua session (cookie) đã xong ở trên.
+        // Mobile không gửi cookie -> đọc token từ query string: wss://host/?token=xxx
+        if (!req.user) {
+          try {
+            const { query } = require('url').parse(req.url, true);
+            if (query.token) req.user = jwt.verify(query.token, SESSION_SECRET);
+          } catch (e) { /* token sai -> req.user vẫn undefined, coi như thiết bị (ESP32) */ }
+        }
         wss.handleUpgrade(req, socket, head, (ws) => {
           wss.emit('connection', ws, req);
         });
@@ -597,6 +661,7 @@ wss.on('connection', (ws, req) => {
   // req.user chỉ tồn tại nếu trình duyệt đã đăng nhập (ESP32 sẽ không có)
   const wsUser   = req.user || null;
   const isAdmin  = wsUser?.role === 'admin';
+  const canControl = isAdmin || wsUser?.role === 'operator'; // viewer = chỉ xem, không được điều khiển
 
   ws.on('message', async (raw) => {
     if (Buffer.isBuffer(raw) && raw[0] !== 0x7b) return;
@@ -657,7 +722,7 @@ wss.on('connection', (ws, req) => {
           ws.send(JSON.stringify({ type: 'error', message: 'Unauthorized' }));
           break;
         }
-        ws.ownerId = wsUser ? String(wsUser._id) : null;
+        ws.ownerId = wsUser ? String(tenantIdOf(wsUser)) : null;
         ws.isAdmin = isAdmin;
         browserClients.add(ws);
         ws.send(JSON.stringify({ type: 'nodes_update',   nodes: getNodeList(ws.ownerId, ws.isAdmin) }));
@@ -714,15 +779,17 @@ wss.on('connection', (ws, req) => {
       }
 
       case 'manual_alert': {
+        if (!canControl) break; // Khách "chỉ xem" (viewer) không được báo cháy thử
         const targetNode = nodes.get(msg.targetNodeId);
         if (!targetNode) break;
-        if (!isAdmin && String(targetNode.info.ownerId) !== String(wsUser?._id)) break; // không phải chủ -> bỏ qua
+        if (!isAdmin && String(targetNode.info.ownerId) !== String(tenantIdOf(wsUser))) break; // không phải chủ -> bỏ qua
         await handleFireEvent(msg.targetNodeId, msg.source || 'manual_web');
         break;
       }
 
       case 'send_tts': {
-        const ownsNode = (n) => isAdmin || String(n.info.ownerId) === String(wsUser?._id);
+        if (!canControl) break; // Khách "chỉ xem" không được phát loa
+        const ownsNode = (n) => isAdmin || String(n.info.ownerId) === String(tenantIdOf(wsUser));
         if (msg.targetNodeId === 'all') {
           for (const [id, node] of nodes) {
             if (node.info.nodeType === NODE_TYPE.CENTER) continue;
@@ -737,15 +804,17 @@ wss.on('connection', (ws, req) => {
       }
 
       case 'button_press': {
+        if (!canControl) break; // Khách "chỉ xem" không được bấm remote node trung tâm
         const btnNode = nodes.get(msg.nodeId);
         broadcastToBrowsers({ type: 'button_press', button: msg.button, nodeId: msg.nodeId }, btnNode?.info.ownerId);
         break;
       }
 
       case 'update_node': {
+        if (!canControl) break; // Khách "chỉ xem" không được sửa tên/vị trí node
         const node = nodes.get(msg.nodeId);
         // Chỉ cho sửa node của chính mình (trừ admin)
-        if (node && !isAdmin && String(node.info.ownerId) !== String(wsUser?._id)) break;
+        if (node && !isAdmin && String(node.info.ownerId) !== String(tenantIdOf(wsUser))) break;
         if (node) {
           if (msg.label)    node.info.label    = msg.label;
           if (msg.location) node.info.location = msg.location;
@@ -762,15 +831,16 @@ wss.on('connection', (ws, req) => {
       }
 
       case 'reset_all': {
+        if (!canControl) break; // Khách "chỉ xem" không được reset hệ thống
         // Chỉ reset các node thuộc về user đang gọi (admin reset được tất cả)
         for (const [id, node] of nodes) {
-          if (!isAdmin && String(node.info.ownerId) !== String(wsUser?._id)) continue;
+          if (!isAdmin && String(node.info.ownerId) !== String(tenantIdOf(wsUser))) continue;
           node.info.status = 'normal';
           sendToNode(id, { type: 'reset' });
         }
         const cId = getCenterId();
         if (cId) sendToNode(cId, { type: 'lora_broadcast', command: 'BUZZER_OFF' });
-        const ownerId = isAdmin ? null : String(wsUser?._id);
+        const ownerId = isAdmin ? null : String(tenantIdOf(wsUser));
         const entry = {
           id: uuidv4(), type: 'reset',
           label: 'Dashboard', location: 'Tất cả',
@@ -797,19 +867,47 @@ wss.on('connection', (ws, req) => {
 // ─── REST API ─────────────────────────────────────────────────────────────────
 app.get('/api/nodes', (req, res) => {
   const isAdmin = req.user?.role === 'admin';
-  res.json(getNodeList(req.user?._id, isAdmin));
+  res.json(getNodeList(tenantIdOf(req.user), isAdmin));
 });
 app.get('/api/alerts', async (req, res) => {
   const isAdmin = req.user?.role === 'admin';
   const limit   = Math.min(parseInt(req.query.limit) || 100, 500);
-  res.json(await dbGetAlerts(req.user?._id, isAdmin, limit));
+  res.json(await dbGetAlerts(tenantIdOf(req.user), isAdmin, limit));
 });
 
-// Tạo mã pairing 6 số để ghép thiết bị ESP32 mới với tài khoản đang đăng nhập
+// Tạo mã mời để thêm 1 thành viên (VD: người thân) vào xem chung hệ thống của mình
+app.post('/api/invite-code', requireRole('admin', 'operator'), async (req, res) => {
+  if (!mongoConnected) return res.status(503).json({ error: 'Cần MongoDB để dùng tính năng mời' });
+  const role = req.body.role === 'operator' ? 'operator' : 'viewer'; // mặc định chỉ xem
+  let code;
+  do { code = String(Math.floor(100000 + Math.random() * 900000)); }
+  while (await InviteCode.findOne({ code, used: false }).lean());
+  // Mã mời luôn gắn với chủ hệ thống thật (nếu chính người tạo mã cũng đang là khách của ai đó)
+  await InviteCode.create({ code, ownerId: tenantIdOf(req.user), role });
+  res.json({ code, role, expiresInSeconds: 3600 });
+});
+
+// User đang đăng nhập nhập mã mời để trở thành "khách" xem hệ thống của người khác
+app.post('/api/join-household', requireAuth, async (req, res) => {
+  const { code } = req.body;
+  const invite = await InviteCode.findOneAndUpdate({ code, used: false }, { used: true }, { new: true });
+  if (!invite) return res.status(400).json({ error: 'Mã mời không hợp lệ hoặc đã hết hạn' });
+  if (String(invite.ownerId) === String(req.user._id)) {
+    return res.status(400).json({ error: 'Không thể tự mời chính mình' });
+  }
+  await User.updateOne({ _id: req.user._id }, { belongsToOwnerId: invite.ownerId, role: invite.role });
+  res.json({ success: true, role: invite.role });
+});
+
+// Rời khỏi hệ thống đang xem chung, quay về làm chủ hệ thống độc lập của chính mình
+app.post('/api/leave-household', requireAuth, async (req, res) => {
+  await User.updateOne({ _id: req.user._id }, { belongsToOwnerId: null, role: 'viewer' });
+  res.json({ success: true });
+});
 app.post('/api/pairing-code', requireRole('admin', 'operator'), async (req, res) => {
   if (!mongoConnected) return res.status(503).json({ error: 'Cần MongoDB để dùng tính năng ghép thiết bị' });
   try {
-    const code = await dbCreatePairingCode(req.user._id);
+    const code = await dbCreatePairingCode(tenantIdOf(req.user));
     res.json({ code, expiresInSeconds: 600 });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -827,10 +925,10 @@ app.patch('/api/nodes/:nodeId/owner', requireRole('admin'), async (req, res) => 
 });
 
 // Chủ hiện tại (hoặc admin) "nhả" node ra -> node về trạng thái chưa ai sở hữu
-app.post('/api/nodes/:nodeId/release', requireAuth, async (req, res) => {
+app.post('/api/nodes/:nodeId/release', requireRole('admin', 'operator'), async (req, res) => {
   const cfg = await dbGetNodeConfig(req.params.nodeId);
   if (!cfg) return res.status(404).json({ error: 'Không tìm thấy node' });
-  const isOwner = String(cfg.ownerId) === String(req.user._id);
+  const isOwner = String(cfg.ownerId) === String(tenantIdOf(req.user));
   if (!isOwner && req.user.role !== 'admin') return res.status(403).json({ error: 'Không phải chủ sở hữu node này' });
 
   const oldOwnerId = cfg.ownerId;
@@ -842,22 +940,22 @@ app.post('/api/nodes/:nodeId/release', requireAuth, async (req, res) => {
 });
 
 // User đang đăng nhập tự nhận 1 node đang "chưa ai sở hữu" bằng mã pairing của chính họ
-app.post('/api/nodes/:nodeId/claim', requireAuth, async (req, res) => {
+app.post('/api/nodes/:nodeId/claim', requireRole('admin', 'operator'), async (req, res) => {
   const { code } = req.body;
   const cfg = await dbGetNodeConfig(req.params.nodeId);
   if (!cfg) return res.status(404).json({ error: 'Không tìm thấy node' });
   if (cfg.ownerId) return res.status(409).json({ error: 'Node này đã có chủ sở hữu, cần release trước' });
 
   const pairing = await PairingCode.findOneAndUpdate(
-    { code, used: false, ownerId: req.user._id },
+    { code, used: false, ownerId: tenantIdOf(req.user) },
     { used: true }, { new: true }
   );
   if (!pairing) return res.status(400).json({ error: 'Mã pairing không hợp lệ, hết hạn, hoặc không phải của bạn' });
 
-  await dbSaveNodeConfig(req.params.nodeId, { ownerId: req.user._id });
+  await dbSaveNodeConfig(req.params.nodeId, { ownerId: tenantIdOf(req.user) });
   const live = nodes.get(req.params.nodeId);
-  if (live) live.info.ownerId = req.user._id;
-  broadcastToBrowsers({ type: 'nodes_update', nodes: getNodeList(req.user._id, false) }, req.user._id);
+  if (live) live.info.ownerId = tenantIdOf(req.user);
+  broadcastToBrowsers({ type: 'nodes_update', nodes: getNodeList(tenantIdOf(req.user), false) }, tenantIdOf(req.user));
   res.json({ success: true });
 });
 app.get('/api/status', (_, res) => res.json({
