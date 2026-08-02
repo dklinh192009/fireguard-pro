@@ -313,18 +313,24 @@ app.get('/auth/google',
   passport.authenticate('google', { scope: ['profile', 'email'] })
 );
 
-// App di động gọi route này thay vì /auth/google — thêm state=mobile để callback biết đường trả token
-app.get('/auth/google/mobile',
-  passport.authenticate('google', { scope: ['profile', 'email'], state: 'mobile' })
-);
+// App di động gọi route này thay vì /auth/google — kèm ?redirect_uri= để biết đường quay về đúng môi trường
+// (Expo Go dùng exp://..., app build thật dùng fireguardapp://...)
+app.get('/auth/google/mobile', (req, res, next) => {
+  const redirectUri = req.query.redirect_uri || 'fireguardapp://auth-callback';
+  const state = Buffer.from(JSON.stringify({ mobile: true, redirectUri })).toString('base64');
+  passport.authenticate('google', { scope: ['profile', 'email'], state })(req, res, next);
+});
 
 app.get('/auth/google/callback',
   passport.authenticate('google', { failureRedirect: '/login.html?error=1' }),
   (req, res) => {
-    if (req.query.state === 'mobile') {
-      // Deep link quay lại app: fireguardapp://auth-callback?token=xxx
+    let stateData = null;
+    try { stateData = JSON.parse(Buffer.from(req.query.state || '', 'base64').toString('utf8')); }
+    catch (e) { /* không phải mobile, state trống hoặc không decode được -> coi như web */ }
+
+    if (stateData?.mobile) {
       const token = signMobileToken(req.user);
-      return res.redirect(`fireguardapp://auth-callback?token=${token}`);
+      return res.redirect(`${stateData.redirectUri}?token=${token}`);
     }
     res.redirect('/');
   }
