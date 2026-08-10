@@ -10,7 +10,6 @@ const MongoStore     = require('connect-mongo');
 const passport       = require('passport');
 const GoogleStrategy = require('passport-google-oauth20').Strategy;
 const fs             = require('fs');
-const admin          = require('firebase-admin');
 const jwt            = require('jsonwebtoken');
 
 function signMobileToken(user) {
@@ -34,21 +33,6 @@ const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID      || '';
 const GOOGLE_SECRET    = process.env.GOOGLE_CLIENT_SECRET  || '';
 const BASE_URL         = process.env.BASE_URL              || 'http://localhost:3000';
 const ADMIN_EMAIL      = process.env.ADMIN_EMAIL           || '';
-const FIREBASE_SA_B64  = process.env.FIREBASE_SERVICE_ACCOUNT_BASE64 || '';
-
-let fcmReady = false;
-if (FIREBASE_SA_B64) {
-  try {
-    const serviceAccount = JSON.parse(Buffer.from(FIREBASE_SA_B64, 'base64').toString('utf8'));
-    admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
-    fcmReady = true;
-    console.log('[FCM] Firebase Admin da khoi tao');
-  } catch (e) {
-    console.error('[FCM] Loi khoi tao Firebase Admin:', e.message);
-  }
-} else {
-  console.warn('[FCM] Chua cau hinh FIREBASE_SERVICE_ACCOUNT_BASE64');
-}
 
 const userSchema = new mongoose.Schema({
   googleId:   { type: String, required: true, unique: true },
@@ -524,34 +508,44 @@ function buildTTSText(receiverId, fireNodeInfo) {
   return `Canh bao chay! Ban dang o khu vuc ${recvLoc}. Khu vuc ${fireLoc} dang co chay. Moi nguoi hay nhanh chong so tan!`;
 }
 
+// ─── PUSH NOTIFICATION (qua Expo Push Service) ─────────────────────────────
+// Không cần Firebase service account nữa — chỉ cần "Expo Push Token" mà app
+// lấy được từ expo-notifications, gửi lên đây, server chuyển tiếp cho Expo lo phần còn lại
 async function sendPushToOwner(ownerId, title, body, data = {}) {
-  if (!fcmReady || !ownerId) return;
+  if (!ownerId) return;
   try {
     const user = await User.findById(ownerId).lean();
-    const tokens = user?.pushTokens || [];
+    const tokens = (user?.pushTokens || []).filter(t => t.startsWith('ExponentPushToken'));
     if (tokens.length === 0) return;
 
-    const res = await admin.messaging().sendEachForMulticast({
-      tokens,
-      notification: { title, body },
-      data: Object.fromEntries(Object.entries(data).map(([k, v]) => [k, String(v)])),
-      android: { priority: 'high' },
-      apns: { payload: { aps: { sound: 'default', 'content-available': 1 } } },
-    });
+    const messages = tokens.map(to => ({
+      to, title, body, data,
+      sound: 'default',
+      priority: 'high',
+      channelId: 'fire-alerts', // phải khớp với channel app tạo (xem utils/notifications.ts)
+    }));
 
+    const res = await fetch('https://exp.host/--/api/v2/push/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json', 'Accept-Encoding': 'gzip, deflate' },
+      body: JSON.stringify(messages),
+    });
+    const result = await res.json();
+
+    // Dọn token chết (app đã gỡ cài đặt...)
     const deadTokens = [];
-    res.responses.forEach((r, i) => {
-      if (!r.success && ['messaging/invalid-registration-token', 'messaging/registration-token-not-registered'].includes(r.error?.code)) {
+    (result.data || []).forEach((r, i) => {
+      if (r.status === 'error' && r.details?.error === 'DeviceNotRegistered') {
         deadTokens.push(tokens[i]);
       }
     });
     if (deadTokens.length > 0) {
       await User.updateOne({ _id: ownerId }, { $pullAll: { pushTokens: deadTokens } });
-      console.log(`[FCM] Da don ${deadTokens.length} token chet cua user ${ownerId}`);
+      console.log(`[PUSH] Da don ${deadTokens.length} token chet cua user ${ownerId}`);
     }
-    console.log(`[FCM] Gui push toi user ${ownerId}: ${res.successCount}/${tokens.length} thanh cong`);
+    console.log(`[PUSH] Gui push toi user ${ownerId}: ${tokens.length} token`);
   } catch (e) {
-    console.error('[FCM] Loi gui push:', e.message);
+    console.error('[PUSH] Loi gui push:', e.message);
   }
 }
 
@@ -923,5 +917,5 @@ server.listen(PORT, () => {
   console.log(`   TTS:  ${(VBEE_TOKEN && VBEE_APP_ID) ? 'OK' : 'No key'}`);
   console.log(`   DB:   ${MONGODB_URI      ? 'Connecting...' : 'No URI (in-memory)'}`);
   console.log(`   Auth: ${GOOGLE_CLIENT_ID ? 'Google OAuth'  : 'No OAuth (open access)'}`);
-  console.log(`   FCM:  ${fcmReady ? 'Push notification bat' : 'Chua cau hinh'}`);
+  console.log(`   Push: Expo Push Service (khong can cau hinh them)`);
 });
