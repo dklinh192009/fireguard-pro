@@ -234,14 +234,20 @@ const passportSession = passport.session();
 app.use(passportInit);
 app.use(passportSession);
 
-function attachTokenAuth(req, res, next) {
+async function attachTokenAuth(req, res, next) {
   if (req.isAuthenticated()) return next();
   const authHeader = req.headers.authorization;
   if (authHeader?.startsWith('Bearer ')) {
     try {
       const payload = jwt.verify(authHeader.slice(7), SESSION_SECRET);
-      req.user = payload;
-      req.isAuthenticated = () => true;
+      // Tra lại DB lấy dữ liệu MỚI NHẤT (role, belongsToOwnerId, alertThresholds...) —
+      // không tin hẳn vào token vì token sống tới 30 ngày, có thể đã lỗi thời
+      // (VD: user vừa join-household, token cũ chưa biết chuyện này)
+      const freshUser = await User.findById(payload._id).lean();
+      if (freshUser) {
+        req.user = freshUser;
+        req.isAuthenticated = () => true;
+      }
     } catch (e) { }
   }
   next();
@@ -297,8 +303,8 @@ app.get('/auth/logout', (req, res) => {
 
 app.get('/api/me', (req, res) => {
   if (!req.isAuthenticated()) return res.json({ authenticated: false });
-  const { name, email, avatar, role, alertThresholds } = req.user;
-  res.json({ authenticated: true, name, email, avatar, role, alertThresholds });
+  const { name, email, avatar, role, alertThresholds, belongsToOwnerId } = req.user;
+  res.json({ authenticated: true, name, email, avatar, role, alertThresholds, belongsToOwnerId });
 });
 
 app.patch('/api/settings/thresholds', requireAuth, async (req, res) => {
@@ -584,11 +590,16 @@ async function handleFireEvent(fireNodeId, source = 'auto') {
 server.on('upgrade', (req, socket, head) => {
   sessionMiddleware(req, {}, () => {
     passportInit(req, {}, () => {
-      passportSession(req, {}, () => {
+      passportSession(req, {}, async () => {
         if (!req.user) {
           try {
             const { query } = require('url').parse(req.url, true);
-            if (query.token) req.user = jwt.verify(query.token, SESSION_SECRET);
+            if (query.token) {
+              const payload = jwt.verify(query.token, SESSION_SECRET);
+              // Cùng lý do như attachTokenAuth: tra lại DB thay vì tin hẳn vào token cũ
+              const freshUser = await User.findById(payload._id).lean();
+              if (freshUser) req.user = freshUser;
+            }
           } catch (e) { }
         }
         wss.handleUpgrade(req, socket, head, (ws) => {
