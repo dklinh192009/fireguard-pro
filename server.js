@@ -829,6 +829,26 @@ app.get('/api/alerts', async (req, res) => {
   res.json(await dbGetAlerts(tenantIdOf(req.user), isAdmin, limit));
 });
 
+app.delete('/api/alerts', async (req, res) => {
+  const { ids } = req.body; // mảng các id (string) của các alert cần xoá, VD: ["abc123", "def456"]
+  if (!Array.isArray(ids) || ids.length === 0) {
+    return res.status(400).json({ error: 'Thieu danh sach id can xoa' });
+  }
+ 
+  const isAdmin = req.user?.role === 'admin';
+  const tenantId = tenantIdOf(req.user);
+ 
+  // Chỉ cho phép xoá alert THUỘC ĐÚNG tenant của mình — tránh trường hợp
+  // 1 user cố tình gửi id của alert người khác lên để xoá trộm dữ liệu.
+  // Admin (isAdmin) được xoá mọi alert, user thường chỉ xoá alert của mình.
+  const filter = isAdmin
+    ? { id: { $in: ids } }
+    : { id: { $in: ids }, ownerId: tenantId };
+ 
+  const result = await Alert.deleteMany(filter);
+  res.json({ success: true, deletedCount: result.deletedCount });
+});
+ 
 app.post('/api/invite-code', requireRole('admin', 'operator'), async (req, res) => {
   if (!mongoConnected) return res.status(503).json({ error: 'Can MongoDB de dung tinh nang moi' });
   const role = req.body.role === 'operator' ? 'operator' : 'viewer';
