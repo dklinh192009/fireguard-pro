@@ -874,6 +874,46 @@ app.post('/api/leave-household', requireAuth, async (req, res) => {
   await User.updateOne({ _id: req.user._id }, { belongsToOwnerId: null, role: 'viewer' });
   res.json({ success: true });
 });
+
+// ============================================================================
+// ENDPOINT MỚI — Quản lý thành viên đã mời (dành cho CHỦ HỘ)
+// Cho phép chủ hộ xem danh sách những tài khoản Google đã được mời vào xem
+// chung hệ thống của mình, và có thể "gỡ" (thu hồi quyền truy cập) từng người.
+//
+// CÁCH DÁN: mở server.js, tìm dòng:
+//   app.post('/api/leave-household', ...);
+// Dán NGUYÊN ĐOẠN BÊN DƯỚI ngay phía DƯỚI route đó.
+// ============================================================================
+
+// Xem danh sách thành viên đã mời — CHỈ chủ hộ (người không có belongsToOwnerId)
+// mới gọi được; người được mời gọi endpoint này sẽ bị từ chối.
+app.get('/api/household-members', async (req, res) => {
+  if (req.user.belongsToOwnerId) {
+    return res.status(403).json({ error: 'Chi chu ho moi xem duoc danh sach thanh vien' });
+  }
+  const members = await User.find({ belongsToOwnerId: req.user._id })
+    .select('name email role avatar')
+    .lean();
+  res.json(members);
+});
+
+// Gỡ 1 thành viên khỏi hộ — đưa họ về trạng thái độc lập (giống hệt khi họ
+// tự bấm "Rời nhóm"), chỉ chủ hộ mới gỡ được, và chỉ gỡ được đúng thành viên
+// thuộc hộ của mình (tránh chủ hộ A gỡ nhầm thành viên của chủ hộ B).
+app.delete('/api/household-members/:userId', async (req, res) => {
+  if (req.user.belongsToOwnerId) {
+    return res.status(403).json({ error: 'Chi chu ho moi thuc hien duoc thao tac nay' });
+  }
+  const member = await User.findOne({ _id: req.params.userId, belongsToOwnerId: req.user._id });
+  if (!member) {
+    return res.status(404).json({ error: 'Khong tim thay thanh vien nay trong he thong cua ban' });
+  }
+  member.belongsToOwnerId = null;
+  member.role = 'viewer';
+  await member.save();
+  res.json({ success: true });
+});
+
 app.post('/api/pairing-code', requireRole('admin', 'operator'), async (req, res) => {
   if (!mongoConnected) return res.status(503).json({ error: 'Can MongoDB de dung tinh nang ghep thiet bi' });
   try {
